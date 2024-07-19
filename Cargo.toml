@@ -1,0 +1,16 @@
+[package]
+name = "liexpr"
+version = "0.1.0"
+edition = "2021"
+authors = ["zzzdong <kuwater@163.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/zzzdong/liexpr"
+homepage = "https://github.com/zzzdong/liexpr"
+description = """
+A library for parsing and evaluating simple expressions.
+"""
+categories = ["compilers", "parser-implementations"]
+keywords = ["scripting", "eval", "expression", "language"]
+
+[dependencies]

@@ -10,6 +10,8 @@ pub enum Token {
     Literal(Literal),
     /// Identifier
     Identifier(String),
+    /// fn
+    Fn,
     /// return
     Return,
     /// let
@@ -158,6 +160,7 @@ impl<'i> Tokenizer<'i> {
                 ch if ch.is_ascii_alphabetic() || ch == '_' => {
                     let s = self.eat_identifier()?;
                     return match s.as_str() {
+                        "fn" => Ok(Token::Fn),
                         "return" => Ok(Token::Return),
                         "let" => Ok(Token::Let),
                         "if" => Ok(Token::If),

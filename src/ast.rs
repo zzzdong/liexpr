@@ -1,13 +1,19 @@
-use core::fmt;
+use std::collections::HashMap;
+use std::fmt;
 
 use crate::tokenizer::Token;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FileId(u32);
 
 #[derive(Debug, Clone)]
 pub struct Program {
     pub(crate) statements: Vec<Statement>,
+    pub(crate) functions: HashMap<String, Function>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Function {
+    pub(crate) name: String,
+    pub(crate) parameters: Vec<String>,
+    pub(crate) body: BlockStatement,
 }
 
 #[derive(Debug, Clone)]
@@ -26,20 +32,22 @@ pub enum Statement {
         initializer: Box<Statement>,
         condition: Option<Box<Expression>>,
         increment: Option<Box<Expression>>,
-        body: Box<Statement>,
+        body: BlockStatement,
     },
     If {
         condition: Box<Expression>,
-        then_branch: Box<Statement>,
+        then_branch: BlockStatement,
         else_branch: Option<Box<Statement>>,
     },
     Expression {
         expression: Box<Expression>,
     },
-    Block {
-        statements: Vec<Statement>,
-    },
+    Block(BlockStatement),
+    Function(Function),
 }
+
+#[derive(Debug, Clone)]
+pub struct BlockStatement(pub(crate) Vec<Statement>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {

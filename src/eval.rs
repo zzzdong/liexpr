@@ -10,6 +10,7 @@ pub enum Value {
     Float(f64),
     String(String),
     Array(Vec<Value>),
+    UserFunction(String),
 }
 
 /// Eval program.
@@ -66,18 +67,25 @@ enum ControlFlow {
 #[derive(Debug)]
 struct Evaluator {
     stack: Vec<StackFrame>,
+    functions: HashMap<String, Function>,
 }
 
 impl Evaluator {
     fn new() -> Self {
         Self {
             stack: vec![StackFrame::new()],
+            functions: HashMap::new(),
         }
     }
 
     fn eval(&mut self, program: &Program) -> Result<Value, String> {
         if program.statements.is_empty() {
             return Ok(Value::Null);
+        }
+
+        self.functions.clone_from(&program.functions);
+        for (name, _func) in &program.functions {
+            self.insert_variable(name, Value::UserFunction(name.to_owned()));
         }
 
         for statement in &program.statements {
@@ -113,15 +121,8 @@ impl Evaluator {
             Statement::Expression { expression } => {
                 self.eval_expression(expression)?;
             }
-            Statement::Block { statements } => {
-                self.stack.push(StackFrame::new());
-                for statement in statements {
-                    if let Some(ctrl) = self.eval_statement(statement)? {
-                        return Ok(Some(ctrl));
-                    }
-                }
-
-                self.stack.pop();
+            Statement::Block(block) => {
+                self.eval_block_statement(block)?;
             }
             Statement::For {
                 initializer,
@@ -140,7 +141,7 @@ impl Evaluator {
                         }
                     }
 
-                    if let Some(ctrl) = self.eval_statement(body)? {
+                    if let Some(ctrl) = self.eval_block_statement(body)? {
                         match ctrl {
                             ControlFlow::Continue => {}
                             ControlFlow::Break => break,
@@ -161,7 +162,7 @@ impl Evaluator {
                 else_branch,
             } => match self.eval_boolean_expression(condition)? {
                 true => {
-                    if let Some(ctrl) = self.eval_statement(then_branch)? {
+                    if let Some(ctrl) = self.eval_block_statement(then_branch)? {
                         return Ok(Some(ctrl));
                     }
                 }
@@ -177,6 +178,23 @@ impl Evaluator {
             Statement::Continue => return Ok(Some(ControlFlow::Continue)),
             _ => unimplemented!("Not implemented statement: {:?}", statement),
         }
+
+        Ok(None)
+    }
+
+    fn eval_block_statement(
+        &mut self,
+        block: &BlockStatement,
+    ) -> Result<Option<ControlFlow>, String> {
+        self.stack.push(StackFrame::new());
+        for statement in &block.0 {
+            if let Some(ctrl) = self.eval_statement(statement)? {
+                self.stack.pop();
+                return Ok(Some(ctrl));
+            }
+        }
+
+        self.stack.pop();
 
         Ok(None)
     }
@@ -616,7 +634,54 @@ impl Evaluator {
         expression: &Expression,
         args: &[Expression],
     ) -> Result<Value, String> {
-        unimplemented!("eval_call_expression not implemented");
+        match expression {
+            Expression::Variable { name } => match self.get_variable(name) {
+                Some(Value::UserFunction(func)) => self.eval_call_function(&func.to_owned(), args),
+                None => {
+                    // when not variable, it should be a function
+                    self.eval_call_function(name, args)
+                }
+                _ => Err(format!(
+                    "Invalid call operation: {:?}({:?})",
+                    expression, args
+                )),
+            },
+            _ => Err(format!(
+                "Invalid call operation: {:?}({:?})",
+                expression, args
+            )),
+        }
+    }
+
+    fn eval_call_function(&mut self, name: &str, args: &[Expression]) -> Result<Value, String> {
+        let func = self
+            .functions
+            .get(name)
+            .cloned()
+            .ok_or(format!("Function not found: {}", name))?;
+
+        self.stack.push(StackFrame::new());
+
+        if args.len() != func.parameters.len() {
+            return Err(format!(
+                "Invalid function call: {:?}({:?}) , args.len() != parameters.len()",
+                name, args
+            ));
+        }
+
+        for (i, arg) in args.iter().enumerate() {
+            let arg = self.eval_expression(arg)?;
+            self.insert_variable(&func.parameters[i], arg);
+        }
+
+        if let Some(ControlFlow::Return(value)) = self.eval_block_statement(&func.body)? {
+            self.stack.pop();
+            return Ok(value);
+        }
+
+        self.stack.pop();
+
+        Ok(Value::Null)
     }
 
     fn set_variable(&mut self, name: &str, value: Value) {
@@ -708,6 +773,58 @@ mod tests {
         let result = eval_expr(expr).unwrap();
 
         assert_eq!(result, Value::Integer(10));
+    }
+
+    #[test]
+    fn test_eval_function() {
+        let script = "
+            fn sum(a, b) {
+                return a + b;
+            }
+            return sum(1, 2);
+        ";
+
+        let result = eval(script).unwrap();
+
+        assert_eq!(result, Value::Integer(3));
+    }
+
+    #[test]
+    fn test_eval_fib_function() {
+        let script = "
+            fn fib(n) {
+                if (n <= 0) {
+                    return 0;
+                }
+                if (n <= 2) {
+                    return 1;
+                }
+                return fib(n - 1) + fib(n - 2);
+            }
+
+            let f = fib;
+
+            return f(10);
+        ";
+
+        let result = eval(script).unwrap();
+
+        assert_eq!(result, Value::Integer(55));
+    }
+
+    #[test]
+    fn test_eval_for_loop() {
+        let script = "
+            let sum = 0;
+            for (let i = 0; i < 10; i++) {
+                sum += i;
+            }
+            return sum;
+        ";
+
+        let result = eval(script).unwrap();
+
+        assert_eq!(result, Value::Integer(45));
     }
 
     #[test]

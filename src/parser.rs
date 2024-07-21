@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::ast::*;
 use crate::tokenizer::{Token, Tokens};
 
@@ -48,13 +50,23 @@ impl Parser {
 
     pub fn parse(&mut self) -> Result<Program, String> {
         let mut statements = Vec::new();
+        let mut functions = HashMap::new();
 
         while let Some(_token) = self.peek_token() {
-            let statement = self.parse_statement()?;
-            statements.push(statement);
+            match self.parse_statement()? {
+                Statement::Function(func) => {
+                    functions.insert(func.name.clone(), func);
+                }
+                stmt => {
+                    statements.push(stmt);
+                }
+            }
         }
 
-        Ok(Program { statements })
+        Ok(Program {
+            statements,
+            functions,
+        })
     }
 
     fn parse_statement(&mut self) -> Result<Statement, String> {
@@ -71,11 +83,56 @@ impl Parser {
             Token::Let => self.parse_let_statement()?,
             Token::For => self.parse_for_statement()?,
             Token::If => self.parse_if_statement()?,
-            Token::LeftBrace => self.parse_block()?,
+            Token::LeftBrace => self.parse_block_statement().map(Statement::Block)?,
+            Token::Fn => self.parse_function_statement().map(Statement::Function)?,
             _ => self.parse_expression_statement()?,
         };
 
         Ok(stmt)
+    }
+
+    fn parse_block_statement(&mut self) -> Result<BlockStatement, String> {
+        self.must_next(&Token::LeftBrace)?;
+
+        let mut statements = Vec::new();
+
+        while let Some(token) = self.peek_token() {
+            match token {
+                Token::RightBrace => {
+                    self.must_next(&Token::RightBrace)?;
+                    break;
+                }
+                _ => {
+                    statements.push(self.parse_statement()?);
+                }
+            }
+        }
+
+        Ok(BlockStatement(statements))
+    }
+
+    fn parse_function_statement(&mut self) -> Result<Function, String> {
+        self.must_next(&Token::Fn)?;
+
+        let name = match self.next_token() {
+            Some(Token::Identifier(name)) => name,
+            _ => return Err("Expected identifier".to_string()),
+        };
+
+        self.must_next(&Token::LeftParen)?;
+
+        let parameters =
+            self.separated_list(Token::Comma, Self::parse_identifier, Token::RightParen)?;
+
+        self.must_next(&Token::RightParen)?;
+
+        let body = self.parse_block_statement()?;
+
+        Ok(Function {
+            name,
+            parameters,
+            body,
+        })
     }
 
     fn parse_break_statement(&mut self) -> Result<Statement, String> {
@@ -152,13 +209,13 @@ impl Parser {
             .terminated_with(Token::RightParen, Self::parse_expr)?
             .map(Box::new);
 
-        let body = self.parse_block()?;
+        let body = self.parse_block_statement()?;
 
         Ok(Statement::For {
             initializer: Box::new(initializer),
             condition,
             increment,
-            body: Box::new(body),
+            body,
         })
     }
 
@@ -171,7 +228,7 @@ impl Parser {
 
         self.must_next(&Token::RightParen)?;
 
-        let then_branch = self.parse_block()?;
+        let then_branch = self.parse_block_statement()?;
 
         let else_branch = match self.peek_token() {
             Some(Token::Else) => {
@@ -183,28 +240,9 @@ impl Parser {
 
         Ok(Statement::If {
             condition: Box::new(condition),
-            then_branch: Box::new(then_branch),
+            then_branch,
             else_branch: else_branch.map(Box::new),
         })
-    }
-
-    fn parse_block(&mut self) -> Result<Statement, String> {
-        self.must_next(&Token::LeftBrace)?;
-
-        let mut statements = vec![];
-
-        while let Some(token) = self.peek_token() {
-            if token == &Token::RightBrace {
-                break;
-            }
-
-            let statement = self.parse_statement()?;
-            statements.push(statement);
-        }
-
-        self.must_next(&Token::RightBrace)?;
-
-        Ok(Statement::Block { statements })
     }
 
     fn parse_expression_statement(&mut self) -> Result<Statement, String> {
@@ -214,6 +252,13 @@ impl Parser {
         Ok(Statement::Expression {
             expression: Box::new(expr),
         })
+    }
+
+    fn parse_identifier(&mut self) -> Result<String, String> {
+        match self.next_token() {
+            Some(Token::Identifier(name)) => Ok(name),
+            _ => Err("Expected identifier".to_string()),
+        }
     }
 
     fn parse_expr(&mut self) -> Result<Expression, String> {
@@ -549,6 +594,16 @@ mod tests {
             let sum = 0;
             for (i = 0; i < 10; i++) {
                 sum += i;
+            }
+
+            fn fib(n) {
+                if (n <= 0) {
+                    return 0;
+                } else if (n == 1) {
+                    return 1;
+                } else {
+                    return fib(n - 1) + fib(n - 2);
+                }
             }
         "#;
 

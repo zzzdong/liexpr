@@ -1,10 +1,14 @@
 use std::{
-    borrow::Borrow,
     collections::HashMap,
     ops::{Deref, DerefMut},
 };
 
-use crate::{ast::*, parser::Parser, value::Value, ValueRef};
+use crate::{
+    ast::*,
+    parser::Parser,
+    value::{Callable, NativeFunction, Value},
+    Object, ValueRef,
+};
 
 /// Eval program.
 ///
@@ -12,14 +16,14 @@ use crate::{ast::*, parser::Parser, value::Value, ValueRef};
 ///
 /// ```
 /// # use liexpr::{eval, Value};
-/// assert_eq!(eval("let x = 5; return x + 1;"), Ok(Value::Integer(6).into()));
+/// assert_eq!(eval("let x = 5; return x + 1;"), Ok(6.into()));
 /// ```
 pub fn eval(expr: &str) -> Result<ValueRef, String> {
     let program = Parser::parse_program(expr)?;
 
-    let mut evaluator = Evaluator::new();
+    let mut evaluator = Evaluator::new(program, Environment::default());
 
-    evaluator.eval(&program)
+    evaluator.eval()
 }
 
 /// Eval expression.
@@ -28,14 +32,56 @@ pub fn eval(expr: &str) -> Result<ValueRef, String> {
 ///
 /// ```
 /// # use liexpr::{eval_expr, Value};
-/// assert_eq!(eval_expr("1 + 2 * 3 - 4"), Ok(Value::Integer(3).into()));
+/// assert_eq!(eval_expr("1 + 2 * 3 - 4"), Ok(3.into()));
 /// ```
 pub fn eval_expr(expr: &str) -> Result<ValueRef, String> {
     let expression = Parser::parse_expression(expr)?;
 
-    let mut evaluator = Evaluator::new();
+    let mut evaluator = Evaluator::default();
 
     evaluator.eval_expression(&expression)
+}
+
+#[derive(Debug)]
+pub struct Environment {
+    variables: HashMap<String, ValueRef>,
+}
+
+impl Environment {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+        }
+    }
+
+    pub fn define(&mut self, name: impl ToString, value: ValueRef) {
+        self.variables.insert(name.to_string(), value);
+    }
+
+    pub fn define_function<Args: 'static>(
+        &mut self,
+        name: impl ToString,
+        callable: impl Callable<Args>,
+    ) {
+        self.define(
+            name.to_string(),
+            Value::new_object(NativeFunction::new(
+                name,
+                Box::new(callable.into_function()),
+            ))
+            .into(),
+        );
+    }
+
+    pub fn take(&mut self, name: impl AsRef<str>) -> Option<ValueRef> {
+        self.variables.remove(name.as_ref())
+    }
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug)]
@@ -60,29 +106,57 @@ enum ControlFlow {
 #[derive(Debug)]
 struct Evaluator {
     stack: Vec<StackFrame>,
-    functions: HashMap<String, Function>,
+    environment: Environment,
+    program: Program,
 }
 
 impl Evaluator {
-    fn new() -> Self {
+    fn new(program: Program, environment: Environment) -> Self {
+        let mut frame = StackFrame::new();
+
+        for (name, value) in &program.functions {
+            frame.locals.insert(
+                name.to_string(),
+                Value::UserFunction(name.to_string()).into(),
+            );
+        }
+
         Self {
-            stack: vec![StackFrame::new()],
-            functions: HashMap::new(),
+            stack: vec![frame],
+            environment,
+            program,
         }
     }
 
-    fn eval(&mut self, program: &Program) -> Result<ValueRef, String> {
-        if program.statements.is_empty() {
+    pub fn eval_script(
+        script: &str,
+        environment: Environment,
+    ) -> Result<(ValueRef, Environment), String> {
+        let mut evaluator = Evaluator::new(Parser::parse_program(script)?, environment);
+
+        evaluator.eval().map(|ret| (ret, evaluator.environment))
+    }
+
+    pub fn eval_expr(
+        script: &str,
+        environment: Environment,
+    ) -> Result<(ValueRef, Environment), String> {
+        let expr = Parser::parse_expression(script)?;
+        let mut evaluator = Evaluator::new(Program::default(), environment);
+
+        evaluator
+            .eval_expression(&expr)
+            .map(|ret| (ret, evaluator.environment))
+    }
+
+    fn eval(&mut self) -> Result<ValueRef, String> {
+        if self.program.statements.is_empty() {
             return Ok(Value::Null.into());
         }
 
-        self.functions.clone_from(&program.functions);
-        for (name, _func) in &program.functions {
-            self.insert_variable(name, Value::UserFunction(name.to_owned()));
-        }
-
-        for statement in &program.statements {
-            if let Some(ControlFlow::Return(ret)) = self.eval_statement(statement)? {
+        for statement in self.program.statements.clone() {
+            let stmt = statement.clone();
+            if let Some(ControlFlow::Return(ret)) = self.eval_statement(&stmt)? {
                 return Ok(ret);
             }
         }
@@ -195,6 +269,7 @@ impl Evaluator {
     fn eval_expression(&mut self, expr: &Expression) -> Result<ValueRef, String> {
         match expr {
             Expression::Literal { value } => match value {
+                Literal::Null => Ok(Value::Null.into()),
                 Literal::Boolean(b) => Ok(Value::Boolean(*b).into()),
                 Literal::Integer(i) => Ok(Value::Integer(*i).into()),
                 Literal::Float(f) => Ok(Value::Float(*f).into()),
@@ -283,13 +358,14 @@ impl Evaluator {
 
             Operator::PlusAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    let lhs = value.borrow();
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
                     let rhs = rhs.borrow();
 
-                    let value = self.binop(&Operator::Plus, lhs.deref(), rhs.deref())?;
+                    let ret = self.binop(&Operator::Plus, value.borrow().deref(), rhs.deref())?;
 
-                    self.set_variable(name, value.into());
+                    *value.borrow_mut() = ret;
                     Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} += {:?}", left, right)),
@@ -297,52 +373,57 @@ impl Evaluator {
 
             Operator::MinusAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    let lhs = value.borrow();
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
                     let rhs = rhs.borrow();
 
-                    let value = self.binop(&Operator::Minus, lhs.deref(), rhs.deref())?;
+                    let ret = self.binop(&Operator::Minus, value.borrow().deref(), rhs.deref())?;
 
-                    self.set_variable(name, value.into());
+                    *value.borrow_mut() = ret;
                     Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} -= {:?}", left, right)),
             },
             Operator::MultiplyAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    let lhs = value.borrow();
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
                     let rhs = rhs.borrow();
 
-                    let value = self.binop(&Operator::Multiply, lhs.deref(), rhs.deref())?;
+                    let ret =
+                        self.binop(&Operator::Multiply, value.borrow().deref(), rhs.deref())?;
 
-                    self.set_variable(name, value.into());
+                    *value.borrow_mut() = ret;
                     Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} *= {:?}", left, right)),
             },
             Operator::DivideAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    let lhs = value.borrow();
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
                     let rhs = rhs.borrow();
 
-                    let value = self.binop(&Operator::Divide, lhs.deref(), rhs.deref())?;
+                    let ret = self.binop(&Operator::Divide, value.borrow().deref(), rhs.deref())?;
 
-                    self.set_variable(name, value.into());
+                    *value.borrow_mut() = ret;
                     Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} /= {:?}", left, right)),
             },
             Operator::ModuloAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    let lhs = value.borrow();
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
                     let rhs = rhs.borrow();
 
-                    let value = self.binop(&Operator::Modulo, lhs.deref(), rhs.deref())?;
+                    let ret = self.binop(&Operator::Modulo, value.borrow().deref(), rhs.deref())?;
 
-                    self.set_variable(name, value.into());
+                    *value.borrow_mut() = ret;
                     Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} %= {:?}", left, right)),
@@ -513,7 +594,9 @@ impl Evaluator {
         match operator {
             Operator::Increase => match expression {
                 Expression::Variable { name } => {
-                    let mut value = self.get_variable(name).unwrap();
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
                     let mut value = value.borrow_mut();
                     match value.deref_mut() {
                         Value::Integer(i) => {
@@ -527,7 +610,9 @@ impl Evaluator {
             },
             Operator::Decrease => match expression {
                 Expression::Variable { name } => {
-                    let mut value = self.get_variable(name).unwrap();
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
                     let mut value = value.borrow_mut();
                     match value.deref_mut() {
                         Value::Integer(i) => {
@@ -580,6 +665,7 @@ impl Evaluator {
                         let value = valule.borrow();
                         match value.deref() {
                             Value::UserFunction(func) => self.eval_call_function(func, args),
+                            Value::Object(obj) => self.eval_object_call(obj.as_ref(), args),
                             _ => Err(format!(
                                 "Invalid call operation: {:?}({:?})",
                                 expression, args
@@ -596,6 +682,32 @@ impl Evaluator {
                     )),
                 }
             }
+            Expression::Binary {
+                left,
+                operator,
+                right,
+            } if operator == &Operator::Access => {
+                let mut left = self.eval_expression(left)?;
+
+                match &**right {
+                    Expression::Variable { name } => {
+                        let mut left = left.borrow_mut();
+                        match left.deref_mut() {
+                            Value::Object(obj) => {
+                                self.eval_object_method_call(obj.as_mut(), name, args)
+                            }
+                            _ => Err(format!(
+                                "Invalid call operation: {:?}({:?})",
+                                expression, args
+                            )),
+                        }
+                    }
+                    _ => Err(format!(
+                        "Invalid call operation: {:?}({:?})",
+                        expression, args
+                    )),
+                }
+            }
             _ => Err(format!(
                 "Invalid call operation: {:?}({:?})",
                 expression, args
@@ -605,6 +717,7 @@ impl Evaluator {
 
     fn eval_call_function(&mut self, name: &str, args: &[Expression]) -> Result<ValueRef, String> {
         let func = self
+            .program
             .functions
             .get(name)
             .cloned()
@@ -634,6 +747,28 @@ impl Evaluator {
         Ok(Value::Null.into())
     }
 
+    fn eval_object_call(
+        &mut self,
+        object: &dyn Object,
+        args: &[Expression],
+    ) -> Result<ValueRef, String> {
+        let args: Result<Vec<ValueRef>, String> =
+            args.iter().map(|arg| self.eval_expression(arg)).collect();
+        Object::call(object, &args?).map(|v| v.unwrap_or(Value::new_null().into()))
+    }
+
+    fn eval_object_method_call(
+        &mut self,
+        object: &mut dyn Object,
+        method: &str,
+        args: &[Expression],
+    ) -> Result<ValueRef, String> {
+        let args: Result<Vec<ValueRef>, String> =
+            args.iter().map(|arg| self.eval_expression(arg)).collect();
+
+        Object::method_call(object, method, &args?).map(|v| v.unwrap_or(Value::new_null().into()))
+    }
+
     fn set_variable(&mut self, name: &str, value: ValueRef) {
         for frame in self.stack.iter_mut().rev() {
             if frame.locals.contains_key(name) {
@@ -658,18 +793,32 @@ impl Evaluator {
             }
         }
 
+        if let Some(value) = self.environment.variables.get(name) {
+            return Some(value.clone());
+        }
+
         None
+    }
+}
+
+impl Default for Evaluator {
+    fn default() -> Self {
+        Self::new(Program::default(), Environment::default())
     }
 }
 
 #[cfg(test)]
 mod tests {
 
+    use std::sync::OnceLock;
+
+    use crate::value::{MetaObject, MetaTable};
+
     use super::*;
 
     #[test]
     fn test_eval_integer_expression() {
-        let mut evaluator = Evaluator::new();
+        let mut evaluator = Evaluator::default();
         let expr = Expression::Literal {
             value: Literal::Integer(42),
         };
@@ -679,7 +828,7 @@ mod tests {
 
     #[test]
     fn test_eval_boolean_expression() {
-        let mut evaluator = Evaluator::new();
+        let mut evaluator = Evaluator::default();
         let expr = Expression::Literal {
             value: Literal::Boolean(true),
         };
@@ -689,7 +838,7 @@ mod tests {
 
     #[test]
     fn test_eval_binary_expression() {
-        let mut evaluator = Evaluator::new();
+        let mut evaluator = Evaluator::default();
         let expr = Expression::Binary {
             left: Box::new(Expression::Literal {
                 value: Literal::Integer(2),
@@ -705,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_eval_prefix_expression() {
-        let mut evaluator = Evaluator::new();
+        let mut evaluator = Evaluator::default();
         let expr = Expression::Prefix {
             operator: Operator::Minus,
             expression: Box::new(Expression::Literal {
@@ -775,6 +924,118 @@ mod tests {
         let result = eval(script).unwrap();
 
         assert_eq!(result, 45);
+    }
+
+    #[test]
+    fn test_eval_native_function() {
+        fn fib(n: i64) -> i64 {
+            if n <= 0 {
+                return 0;
+            }
+            if n <= 2 {
+                return 1;
+            }
+            fib(n - 1) + fib(n - 2)
+        }
+
+        let mut env = Environment::new();
+
+        env.define_function("fib", fib);
+
+        let result = Evaluator::eval_expr("fib(10)", env);
+
+        assert_eq!(result.map(|(ret, _)| ret), Ok(55.into()));
+    }
+
+    #[test]
+    fn test_eval_string_object() {
+        let script = r#"
+            s.push("hello");
+            s.push(" world");
+            return s;
+        "#;
+
+        let s = ValueRef::new(Value::new_object(String::new()));
+
+        let mut env = Environment::new();
+
+        env.define("s", s);
+
+        let result = Evaluator::eval_script(script, env);
+
+        assert!(result.is_ok());
+        println!("=> {:?}", result.unwrap());
+    }
+
+    #[test]
+    fn test_eval_object() {
+        #[derive(Debug)]
+        struct Request {
+            headers: HashMap<String, Vec<String>>,
+            body: String,
+        }
+
+        impl Request {
+            fn new() -> Self {
+                Request {
+                    headers: HashMap::new(),
+                    body: "".to_string(),
+                }
+            }
+        }
+
+        impl MetaObject for Request {
+            fn meta_table() -> &'static MetaTable<Self> {
+                static META: OnceLock<MetaTable<Request>> = OnceLock::new();
+                META.get_or_init(|| {
+                    MetaTable::build()
+                        .with_method(
+                            "set_header",
+                            Box::new(|this: &mut Self, args: &[ValueRef]| {
+                                let key = args[0].as_string()?;
+                                let value = args[1].as_string()?;
+
+                                this.headers.insert(key, vec![value]);
+
+                                Ok(None)
+                            }),
+                        )
+                        .with_method(
+                            "add_header",
+                            Box::new(|this: &mut Self, args: &[ValueRef]| {
+                                let key = args[0].as_string()?;
+                                let value = args[1].as_string()?;
+
+                                this.headers.entry(key).or_default().push(value);
+
+                                Ok(None)
+                            }),
+                        )
+                        .fininal()
+                })
+            }
+        }
+
+        let script = r#"
+            req.set_header("Content-Type", "application/json");
+            req.add_header("foo", "bar");
+            req.add_header("foo", "barbar");
+        "#;
+
+        let req = ValueRef::new(Value::new_object(Request::new()));
+
+        let mut env = Environment::new();
+
+        env.define("req", req);
+
+        let result = Evaluator::eval_script(script, env);
+
+        assert!(result.is_ok());
+        let (ret, mut env) = result.unwrap();
+        println!(
+            "=> {:?}",
+            env.take("req").take().unwrap().take().as_object()
+        );
     }
 
     #[test]

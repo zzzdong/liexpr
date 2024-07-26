@@ -51,7 +51,6 @@ pub struct BlockStatement(pub(crate) Vec<Statement>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
-    Empty,
     Binary {
         left: Box<Expression>,
         operator: Operator,

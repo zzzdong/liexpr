@@ -54,8 +54,8 @@ impl Environment {
         }
     }
 
-    pub fn define(&mut self, name: impl ToString, value: ValueRef) {
-        self.variables.insert(name.to_string(), value);
+    pub fn define(&mut self, name: impl ToString, value: impl Into<ValueRef>) {
+        self.variables.insert(name.to_string(), value.into());
     }
 
     pub fn define_function<Args: 'static>(
@@ -68,13 +68,12 @@ impl Environment {
             Value::new_object(NativeFunction::new(
                 name,
                 Box::new(callable.into_function()),
-            ))
-            .into(),
+            )),
         );
     }
 
-    pub fn take(&mut self, name: impl AsRef<str>) -> Option<ValueRef> {
-        self.variables.remove(name.as_ref())
+    pub fn take(&mut self, name: impl AsRef<str>) -> Option<Value> {
+        self.variables.remove(name.as_ref()).map(|v| v.take())
     }
 }
 
@@ -114,7 +113,7 @@ impl Evaluator {
     fn new(program: Program, environment: Environment) -> Self {
         let mut frame = StackFrame::new();
 
-        for (name, value) in &program.functions {
+        for name in program.functions.keys() {
             frame.locals.insert(
                 name.to_string(),
                 Value::UserFunction(name.to_string()).into(),
@@ -299,7 +298,6 @@ impl Evaluator {
             } => self.eval_postfix_expression(operator, expression),
             Expression::Index { callee, index } => self.eval_index_expression(callee, index),
             Expression::Call { callee, arguments } => self.eval_call_expression(callee, arguments),
-            Expression::Empty => Ok(Value::Null.into()),
         }
     }
 
@@ -676,10 +674,6 @@ impl Evaluator {
                         // when not variable, it should be a function
                         self.eval_call_function(name, args)
                     }
-                    _ => Err(format!(
-                        "Invalid call operation: {:?}({:?})",
-                        expression, args
-                    )),
                 }
             }
             Expression::Binary {
@@ -1022,7 +1016,7 @@ mod tests {
             req.add_header("foo", "barbar");
         "#;
 
-        let req = ValueRef::new(Value::new_object(Request::new()));
+        let req = ValueRef::with_object(Box::new(Request::new()));
 
         let mut env = Environment::new();
 
@@ -1032,10 +1026,7 @@ mod tests {
 
         assert!(result.is_ok());
         let (ret, mut env) = result.unwrap();
-        println!(
-            "=> {:?}",
-            env.take("req").take().unwrap().take().as_object()
-        );
+        println!("=> {:?}", env.take("req").take().unwrap().as_object());
     }
 
     #[test]

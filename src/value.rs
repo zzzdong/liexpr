@@ -689,13 +689,13 @@ impl<T> MetaTableBuilder<T> {
     pub fn with_method(
         mut self,
         name: impl ToString,
-        func: Box<dyn Fn(&mut T, &[ValueRef]) -> Result<Option<ValueRef>, String> + Send + Sync>,
+        func: impl Fn(&mut T, &[ValueRef]) -> Result<Option<ValueRef>, String> + Send + Sync + 'static,
     ) -> Self {
         self.inner.methods.insert(
             name.to_string(),
             MethodFunction {
                 name: name.to_string(),
-                func,
+                func: Box::new(func),
             },
         );
         self

@@ -421,7 +421,7 @@ impl Parser {
 
         while let Some(token) = self.peek_token() {
             if token == &terminater {
-                break;
+                return Ok(list);
             }
 
             list.push(parse_fn(self)?);

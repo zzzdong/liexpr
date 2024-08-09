@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::tokenizer::Token;
 
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub(crate) statements: Vec<Statement>,
-    pub(crate) functions: HashMap<String, Function>,
+    pub(crate) functions: HashMap<String, Rc<Function>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,11 @@ pub enum Expression {
     Array {
         elements: Vec<Expression>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayExpression {
+    elements: Vec<Expression>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

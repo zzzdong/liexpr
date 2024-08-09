@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::ast::*;
 use crate::tokenizer::{Token, Tokens};
@@ -55,7 +56,7 @@ impl Parser {
         while let Some(_token) = self.peek_token() {
             match self.parse_statement()? {
                 Statement::Function(func) => {
-                    functions.insert(func.name.clone(), func);
+                    functions.insert(func.name.clone(), Rc::new(func));
                 }
                 stmt => {
                     statements.push(stmt);

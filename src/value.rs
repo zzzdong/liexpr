@@ -47,9 +47,18 @@ impl Value {
         Value::Object(Box::new(object))
     }
 
-    pub fn as_object(self) -> Option<Box<dyn Object>> {
+    pub fn as_object<T>(&self) -> Option<&T>
+    where
+        T: Object,
+    {
         match self {
-            Value::Object(object) => Some(object),
+            Value::Object(object) => {
+                if let Some(object) = (object as &dyn std::any::Any).downcast_ref::<T>() {
+                    Some(object)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }

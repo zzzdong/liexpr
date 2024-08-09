@@ -1,17 +1,14 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+};
 
-use crate::{ast::*, parser::Parser};
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Null,
-    Boolean(bool),
-    Integer(i64),
-    Float(f64),
-    String(String),
-    Array(Vec<Value>),
-    UserFunction(String),
-}
+use crate::{
+    ast::*,
+    parser::Parser,
+    value::{Callable, NativeFunction, Value},
+    Object, ValueRef,
+};
 
 /// Eval program.
 ///
@@ -19,14 +16,14 @@ pub enum Value {
 ///
 /// ```
 /// # use liexpr::{eval, Value};
-/// assert_eq!(eval("let x = 5; return x + 1;"), Ok(Value::Integer(6)));
+/// assert_eq!(eval("let x = 5; return x + 1;"), Ok(6.into()));
 /// ```
-pub fn eval(expr: &str) -> Result<Value, String> {
+pub fn eval(expr: &str) -> Result<ValueRef, String> {
     let program = Parser::parse_program(expr)?;
 
-    let mut evaluator = Evaluator::new();
+    let mut evaluator = Evaluator::new(program, Environment::default());
 
-    evaluator.eval(&program)
+    evaluator.eval()
 }
 
 /// Eval expression.
@@ -35,19 +32,60 @@ pub fn eval(expr: &str) -> Result<Value, String> {
 ///
 /// ```
 /// # use liexpr::{eval_expr, Value};
-/// assert_eq!(eval_expr("1 + 2 * 3 - 4"), Ok(Value::Integer(3)));
+/// assert_eq!(eval_expr("1 + 2 * 3 - 4"), Ok(3.into()));
 /// ```
-pub fn eval_expr(expr: &str) -> Result<Value, String> {
+pub fn eval_expr(expr: &str) -> Result<ValueRef, String> {
     let expression = Parser::parse_expression(expr)?;
 
-    let mut evaluator = Evaluator::new();
+    let mut evaluator = Evaluator::default();
 
     evaluator.eval_expression(&expression)
 }
 
 #[derive(Debug)]
+pub struct Environment {
+    variables: HashMap<String, ValueRef>,
+}
+
+impl Environment {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+        }
+    }
+
+    pub fn define(&mut self, name: impl ToString, value: impl Into<ValueRef>) {
+        self.variables.insert(name.to_string(), value.into());
+    }
+
+    pub fn define_function<Args: 'static>(
+        &mut self,
+        name: impl ToString,
+        callable: impl Callable<Args>,
+    ) {
+        self.define(
+            name.to_string(),
+            Value::new_object(NativeFunction::new(
+                name,
+                Box::new(callable.into_function()),
+            )),
+        );
+    }
+
+    pub fn take(&mut self, name: impl AsRef<str>) -> Option<Value> {
+        self.variables.remove(name.as_ref()).map(|v| v.take())
+    }
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
 struct StackFrame {
-    locals: HashMap<String, Value>,
+    locals: HashMap<String, ValueRef>,
 }
 
 impl StackFrame {
@@ -59,7 +97,7 @@ impl StackFrame {
 }
 
 enum ControlFlow {
-    Return(Value),
+    Return(ValueRef),
     Break,
     Continue,
 }
@@ -67,34 +105,62 @@ enum ControlFlow {
 #[derive(Debug)]
 struct Evaluator {
     stack: Vec<StackFrame>,
-    functions: HashMap<String, Function>,
+    environment: Environment,
+    program: Program,
 }
 
 impl Evaluator {
-    fn new() -> Self {
+    fn new(program: Program, environment: Environment) -> Self {
+        let mut frame = StackFrame::new();
+
+        for name in program.functions.keys() {
+            frame.locals.insert(
+                name.to_string(),
+                Value::UserFunction(name.to_string()).into(),
+            );
+        }
+
         Self {
-            stack: vec![StackFrame::new()],
-            functions: HashMap::new(),
+            stack: vec![frame],
+            environment,
+            program,
         }
     }
 
-    fn eval(&mut self, program: &Program) -> Result<Value, String> {
-        if program.statements.is_empty() {
-            return Ok(Value::Null);
+    pub fn eval_script(
+        script: &str,
+        environment: Environment,
+    ) -> Result<(ValueRef, Environment), String> {
+        let mut evaluator = Evaluator::new(Parser::parse_program(script)?, environment);
+
+        evaluator.eval().map(|ret| (ret, evaluator.environment))
+    }
+
+    pub fn eval_expr(
+        script: &str,
+        environment: Environment,
+    ) -> Result<(ValueRef, Environment), String> {
+        let expr = Parser::parse_expression(script)?;
+        let mut evaluator = Evaluator::new(Program::default(), environment);
+
+        evaluator
+            .eval_expression(&expr)
+            .map(|ret| (ret, evaluator.environment))
+    }
+
+    fn eval(&mut self) -> Result<ValueRef, String> {
+        if self.program.statements.is_empty() {
+            return Ok(Value::Null.into());
         }
 
-        self.functions.clone_from(&program.functions);
-        for (name, _func) in &program.functions {
-            self.insert_variable(name, Value::UserFunction(name.to_owned()));
-        }
-
-        for statement in &program.statements {
-            if let Some(ControlFlow::Return(ret)) = self.eval_statement(statement)? {
+        for statement in self.program.statements.clone() {
+            let stmt = statement.clone();
+            if let Some(ControlFlow::Return(ret)) = self.eval_statement(&stmt)? {
                 return Ok(ret);
             }
         }
 
-        Ok(Value::Null)
+        Ok(Value::Null.into())
     }
 
     fn eval_statement(&mut self, statement: &Statement) -> Result<Option<ControlFlow>, String> {
@@ -104,7 +170,7 @@ impl Evaluator {
             Statement::Return { value } => {
                 let ret = match value {
                     Some(expr) => self.eval_expression(expr)?,
-                    None => Value::Null,
+                    None => Value::Null.into(),
                 };
                 return Ok(Some(ControlFlow::Return(ret)));
             }
@@ -199,13 +265,14 @@ impl Evaluator {
         Ok(None)
     }
 
-    fn eval_expression(&mut self, expr: &Expression) -> Result<Value, String> {
+    fn eval_expression(&mut self, expr: &Expression) -> Result<ValueRef, String> {
         match expr {
             Expression::Literal { value } => match value {
-                Literal::Boolean(b) => Ok(Value::Boolean(*b)),
-                Literal::Integer(i) => Ok(Value::Integer(*i)),
-                Literal::Float(f) => Ok(Value::Float(*f)),
-                Literal::String(s) => Ok(Value::String(s.clone())),
+                Literal::Null => Ok(Value::Null.into()),
+                Literal::Boolean(b) => Ok(Value::Boolean(*b).into()),
+                Literal::Integer(i) => Ok(Value::Integer(*i).into()),
+                Literal::Float(f) => Ok(Value::Float(*f).into()),
+                Literal::String(s) => Ok(Value::String(s.clone()).into()),
             },
             Expression::Variable { name } => {
                 if let Some(value) = self.get_variable(name) {
@@ -231,21 +298,22 @@ impl Evaluator {
             } => self.eval_postfix_expression(operator, expression),
             Expression::Index { callee, index } => self.eval_index_expression(callee, index),
             Expression::Call { callee, arguments } => self.eval_call_expression(callee, arguments),
-            Expression::Empty => Ok(Value::Null),
         }
     }
 
-    fn eval_array_expression(&mut self, elements: &[Expression]) -> Result<Value, String> {
+    fn eval_array_expression(&mut self, elements: &[Expression]) -> Result<ValueRef, String> {
         let mut values = vec![];
         for element in elements {
             values.push(self.eval_expression(element)?);
         }
-        Ok(Value::Array(values))
+        Ok(Value::Array(values).into())
     }
 
     fn eval_boolean_expression(&mut self, expr: &Expression) -> Result<bool, String> {
-        match self.eval_expression(expr)? {
-            Value::Boolean(b) => Ok(b),
+        let value = self.eval_expression(expr)?;
+        let value = value.borrow();
+        match value.deref() {
+            Value::Boolean(b) => Ok(*b),
             v => Err(format!("Expected boolean value, but found {v:?}")),
         }
     }
@@ -255,283 +323,106 @@ impl Evaluator {
         left: &Expression,
         operator: &Operator,
         right: &Expression,
-    ) -> Result<Value, String> {
+    ) -> Result<ValueRef, String> {
         let rhs = self.eval_expression(right)?;
 
         match operator {
-            Operator::Plus => {
+            Operator::Plus
+            | Operator::Minus
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulo
+            | Operator::Equal
+            | Operator::NotEqual
+            | Operator::Greater
+            | Operator::GreaterEqual
+            | Operator::Less
+            | Operator::LessEqual
+            | Operator::LogicalAnd
+            | Operator::LogicalOr => {
                 let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l + r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l + r)),
-                    (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l + r as f64)),
-                    (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 + r)),
-                    (Value::String(l), Value::String(r)) => Ok(Value::String(l + &r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::Minus => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l - r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
-                    (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l - r as f64)),
-                    (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 - r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::Multiply => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l * r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l * r)),
-                    (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l * r as f64)),
-                    (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 * r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::Divide => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l / r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l / r)),
-                    (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l / r as f64)),
-                    (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 / r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::Modulo => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l % r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::Equal => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l == r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l == r)),
-                    (Value::String(l), Value::String(r)) => Ok(Value::Boolean(l == r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::NotEqual => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l != r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l != r)),
-                    (Value::String(l), Value::String(r)) => Ok(Value::Boolean(l != r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::Greater => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l > r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l > r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::GreaterEqual => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l >= r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l >= r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::Less => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l < r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l < r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::LessEqual => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l <= r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l <= r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::LogicalAnd => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(l && r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
-            }
-            Operator::LogicalOr => {
-                let lhs = self.eval_expression(left)?;
-                match (lhs, rhs) {
-                    (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(l || r)),
-                    _ => Err(format!(
-                        "Invalid binary operation: {:?} {} {:?}",
-                        left, operator, right
-                    )),
-                }
+                let lhs = lhs.borrow();
+                let rhs = rhs.borrow();
+                self.binop(operator, lhs.deref(), rhs.deref())
+                    .map(Into::into)
             }
             Operator::Assign => match left {
                 Expression::Variable { name } => {
                     self.set_variable(name, rhs);
-                    Ok(Value::Null)
+                    Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} = {:?}", left, right)),
             },
 
             Operator::PlusAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    match (value, rhs) {
-                        (Value::Integer(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Integer(l + r));
-                            Ok(Value::Null)
-                        }
-                        (Value::Float(l), Value::Float(r)) => {
-                            self.set_variable(name, Value::Float(l + r));
-                            Ok(Value::Null)
-                        }
-                        (Value::Float(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Float(l + r as f64));
-                            Ok(Value::Null)
-                        }
-                        (Value::String(l), Value::String(r)) => {
-                            self.set_variable(name, Value::String(l.to_owned() + &r));
-                            Ok(Value::Null)
-                        }
-                        _ => Err(format!(
-                            "Invalid binary operation: {:?} += {:?}",
-                            left, right
-                        )),
-                    }
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
+                    let rhs = rhs.borrow();
+
+                    let ret = self.binop(&Operator::Plus, value.borrow().deref(), rhs.deref())?;
+
+                    *value.borrow_mut() = ret;
+                    Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} += {:?}", left, right)),
             },
 
             Operator::MinusAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    match (value, rhs) {
-                        (Value::Integer(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Integer(l - r));
-                            Ok(Value::Null)
-                        }
-                        (Value::Float(l), Value::Float(r)) => {
-                            self.set_variable(name, Value::Float(l - r));
-                            Ok(Value::Null)
-                        }
-                        (Value::Float(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Float(l - r as f64));
-                            Ok(Value::Null)
-                        }
-                        _ => Err(format!(
-                            "Invalid binary operation: {:?} -= {:?}",
-                            left, right
-                        )),
-                    }
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
+                    let rhs = rhs.borrow();
+
+                    let ret = self.binop(&Operator::Minus, value.borrow().deref(), rhs.deref())?;
+
+                    *value.borrow_mut() = ret;
+                    Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} -= {:?}", left, right)),
             },
             Operator::MultiplyAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    match (value, rhs) {
-                        (Value::Integer(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Integer(l * r));
-                            Ok(Value::Null)
-                        }
-                        (Value::Float(l), Value::Float(r)) => {
-                            self.set_variable(name, Value::Float(l * r));
-                            Ok(Value::Null)
-                        }
-                        (Value::Float(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Float(l * r as f64));
-                            Ok(Value::Null)
-                        }
-                        _ => Err(format!(
-                            "Invalid binary operation: {:?} *= {:?}",
-                            left, right
-                        )),
-                    }
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
+                    let rhs = rhs.borrow();
+
+                    let ret =
+                        self.binop(&Operator::Multiply, value.borrow().deref(), rhs.deref())?;
+
+                    *value.borrow_mut() = ret;
+                    Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} *= {:?}", left, right)),
             },
             Operator::DivideAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    match (value, rhs) {
-                        (Value::Integer(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Integer(l / r));
-                            Ok(Value::Null)
-                        }
-                        (Value::Float(l), Value::Float(r)) => {
-                            self.set_variable(name, Value::Float(l / r));
-                            Ok(Value::Null)
-                        }
-                        (Value::Float(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Float(l / r as f64));
-                            Ok(Value::Null)
-                        }
-                        _ => Err(format!(
-                            "Invalid binary operation: {:?} /= {:?}",
-                            left, right
-                        )),
-                    }
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
+                    let rhs = rhs.borrow();
+
+                    let ret = self.binop(&Operator::Divide, value.borrow().deref(), rhs.deref())?;
+
+                    *value.borrow_mut() = ret;
+                    Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} /= {:?}", left, right)),
             },
             Operator::ModuloAssign => match left {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    match (value, rhs) {
-                        (Value::Integer(l), Value::Integer(r)) => {
-                            self.set_variable(name, Value::Integer(l % r));
-                            Ok(Value::Null)
-                        }
-                        _ => Err(format!(
-                            "Invalid binary operation: {:?} %= {:?}",
-                            left, right
-                        )),
-                    }
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
+                    let rhs = rhs.borrow();
+
+                    let ret = self.binop(&Operator::Modulo, value.borrow().deref(), rhs.deref())?;
+
+                    *value.borrow_mut() = ret;
+                    Ok(Value::Null.into())
                 }
                 _ => Err(format!("Invalid assignment: {:?} %= {:?}", left, right)),
             },
@@ -543,23 +434,145 @@ impl Evaluator {
         }
     }
 
+    fn binop(&mut self, operator: &Operator, lhs: &Value, rhs: &Value) -> Result<Value, String> {
+        match operator {
+            Operator::Plus => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l + r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l + r)),
+                (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l + *r as f64)),
+                (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(*l as f64 + r)),
+                (Value::String(l), Value::String(r)) => Ok(Value::String(l.clone() + r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::Minus => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l - r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
+                (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l - *r as f64)),
+                (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(*l as f64 - r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::Multiply => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l * r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l * r)),
+                (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l * *r as f64)),
+                (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(*l as f64 * r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::Divide => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l / r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l / r)),
+                (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l / *r as f64)),
+                (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(*l as f64 / r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::Modulo => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l % r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::Equal => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l == r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l == r)),
+                (Value::String(l), Value::String(r)) => Ok(Value::Boolean(l == r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::NotEqual => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l != r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l != r)),
+                (Value::String(l), Value::String(r)) => Ok(Value::Boolean(l != r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::Greater => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l > r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l > r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::GreaterEqual => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l >= r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l >= r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::Less => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l < r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l < r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::LessEqual => match (lhs, rhs) {
+                (Value::Integer(l), Value::Integer(r)) => Ok(Value::Boolean(l <= r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Boolean(l <= r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::LogicalAnd => match (lhs, rhs) {
+                (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(*l && *r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+            Operator::LogicalOr => match (lhs, rhs) {
+                (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(*l || *r)),
+                _ => Err(format!(
+                    "Invalid binary operation: {:?} {} {:?}",
+                    lhs, operator, rhs
+                )),
+            },
+
+            _ => Err(format!(
+                "Unsupported binary operation: {:?} {} {:?}",
+                lhs, operator, rhs
+            )),
+        }
+    }
+
     fn eval_prefix_expression(
         &mut self,
         operator: &Operator,
         expression: &Expression,
-    ) -> Result<Value, String> {
+    ) -> Result<ValueRef, String> {
         match operator {
             Operator::Negate => match expression {
                 Expression::Literal {
                     value: Literal::Boolean(b),
-                } => Ok(Value::Boolean(!b)),
+                } => Ok(Value::Boolean(!b).into()),
 
                 _ => Err(format!("Invalid prefix operation: !{:?}", expression)),
             },
             Operator::Minus => match expression {
                 Expression::Literal { value } => match value {
-                    Literal::Integer(i) => Ok(Value::Integer(-i)),
-                    Literal::Float(f) => Ok(Value::Float(-f)),
+                    Literal::Integer(i) => Ok(Value::Integer(-i).into()),
+                    Literal::Float(f) => Ok(Value::Float(-f).into()),
                     _ => Err(format!("Invalid prefix operation: -{:?}", expression)),
                 },
                 _ => Err(format!("Invalid prefix operation: -{:?}", expression)),
@@ -575,15 +588,18 @@ impl Evaluator {
         &mut self,
         operator: &Operator,
         expression: &Expression,
-    ) -> Result<Value, String> {
+    ) -> Result<ValueRef, String> {
         match operator {
             Operator::Increase => match expression {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    match value {
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
+                    let mut value = value.borrow_mut();
+                    match value.deref_mut() {
                         Value::Integer(i) => {
-                            self.set_variable(name, Value::Integer(i + 1));
-                            Ok(Value::Null)
+                            *i += 1;
+                            Ok(Value::Null.into())
                         }
                         _ => Err(format!("Invalidpostfix operation: {:?}++", expression)),
                     }
@@ -592,11 +608,14 @@ impl Evaluator {
             },
             Operator::Decrease => match expression {
                 Expression::Variable { name } => {
-                    let value = self.get_variable(name).unwrap();
-                    match value {
+                    let mut value = self
+                        .get_variable(name)
+                        .ok_or(format!("Variable not found: {}", name))?;
+                    let mut value = value.borrow_mut();
+                    match value.deref_mut() {
                         Value::Integer(i) => {
-                            self.set_variable(name, Value::Integer(i - 1));
-                            Ok(Value::Null)
+                            *i -= 1;
+                            Ok(Value::Null.into())
                         }
                         _ => Err(format!("Invalid postfixoperation: {:?}--", expression)),
                     }
@@ -614,16 +633,19 @@ impl Evaluator {
         &mut self,
         left: &Expression,
         index: &Expression,
-    ) -> Result<Value, String> {
+    ) -> Result<ValueRef, String> {
         let value = self.eval_expression(left)?;
         let idx = self.eval_expression(index)?;
 
-        match (value, idx) {
+        let array = value.borrow();
+        let idx = idx.borrow();
+
+        match (array.deref(), idx.deref()) {
             (Value::Array(array), Value::Integer(i)) => {
-                if i < 0 || i >= array.len() as i64 {
+                if *i < 0 || *i >= array.len() as i64 {
                     return Err(format!("Index out of bounds: {:?}[{:?}]", left, index));
                 }
-                Ok(array[i as usize].clone())
+                Ok(array[*i as usize].clone())
             }
             _ => Err(format!("Invalid index operation: {:?}[{:?}]", left, index)),
         }
@@ -633,19 +655,53 @@ impl Evaluator {
         &mut self,
         expression: &Expression,
         args: &[Expression],
-    ) -> Result<Value, String> {
+    ) -> Result<ValueRef, String> {
         match expression {
-            Expression::Variable { name } => match self.get_variable(name) {
-                Some(Value::UserFunction(func)) => self.eval_call_function(&func.to_owned(), args),
-                None => {
-                    // when not variable, it should be a function
-                    self.eval_call_function(name, args)
+            Expression::Variable { name } => {
+                match self.get_variable(name) {
+                    Some(valule) => {
+                        let value = valule.borrow();
+                        match value.deref() {
+                            Value::UserFunction(func) => self.eval_call_function(func, args),
+                            Value::Object(obj) => self.eval_object_call(obj.as_ref(), args),
+                            _ => Err(format!(
+                                "Invalid call operation: {:?}({:?})",
+                                expression, args
+                            )),
+                        }
+                    }
+                    None => {
+                        // when not variable, it should be a function
+                        self.eval_call_function(name, args)
+                    }
                 }
-                _ => Err(format!(
-                    "Invalid call operation: {:?}({:?})",
-                    expression, args
-                )),
-            },
+            }
+            Expression::Binary {
+                left,
+                operator,
+                right,
+            } if operator == &Operator::Access => {
+                let mut left = self.eval_expression(left)?;
+
+                match &**right {
+                    Expression::Variable { name } => {
+                        let mut left = left.borrow_mut();
+                        match left.deref_mut() {
+                            Value::Object(obj) => {
+                                self.eval_object_method_call(obj.as_mut(), name, args)
+                            }
+                            _ => Err(format!(
+                                "Invalid call operation: {:?}({:?})",
+                                expression, args
+                            )),
+                        }
+                    }
+                    _ => Err(format!(
+                        "Invalid call operation: {:?}({:?})",
+                        expression, args
+                    )),
+                }
+            }
             _ => Err(format!(
                 "Invalid call operation: {:?}({:?})",
                 expression, args
@@ -653,8 +709,9 @@ impl Evaluator {
         }
     }
 
-    fn eval_call_function(&mut self, name: &str, args: &[Expression]) -> Result<Value, String> {
+    fn eval_call_function(&mut self, name: &str, args: &[Expression]) -> Result<ValueRef, String> {
         let func = self
+            .program
             .functions
             .get(name)
             .cloned()
@@ -681,10 +738,32 @@ impl Evaluator {
 
         self.stack.pop();
 
-        Ok(Value::Null)
+        Ok(Value::Null.into())
     }
 
-    fn set_variable(&mut self, name: &str, value: Value) {
+    fn eval_object_call(
+        &mut self,
+        object: &dyn Object,
+        args: &[Expression],
+    ) -> Result<ValueRef, String> {
+        let args: Result<Vec<ValueRef>, String> =
+            args.iter().map(|arg| self.eval_expression(arg)).collect();
+        Object::call(object, &args?).map(|v| v.unwrap_or(Value::new_null().into()))
+    }
+
+    fn eval_object_method_call(
+        &mut self,
+        object: &mut dyn Object,
+        method: &str,
+        args: &[Expression],
+    ) -> Result<ValueRef, String> {
+        let args: Result<Vec<ValueRef>, String> =
+            args.iter().map(|arg| self.eval_expression(arg)).collect();
+
+        Object::method_call(object, method, &args?).map(|v| v.unwrap_or(Value::new_null().into()))
+    }
+
+    fn set_variable(&mut self, name: &str, value: ValueRef) {
         for frame in self.stack.iter_mut().rev() {
             if frame.locals.contains_key(name) {
                 frame.locals.insert(name.to_string(), value);
@@ -693,53 +772,67 @@ impl Evaluator {
         }
     }
 
-    fn insert_variable(&mut self, name: &str, value: Value) {
+    fn insert_variable(&mut self, name: &str, value: impl Into<ValueRef>) {
         self.stack
             .last_mut()
             .unwrap()
             .locals
-            .insert(name.to_string(), value);
+            .insert(name.to_string(), value.into());
     }
 
-    fn get_variable(&self, name: &str) -> Option<&Value> {
+    fn get_variable(&self, name: &str) -> Option<ValueRef> {
         for frame in self.stack.iter().rev() {
             if let Some(value) = frame.locals.get(name) {
-                return Some(value);
+                return Some(value.clone());
             }
+        }
+
+        if let Some(value) = self.environment.variables.get(name) {
+            return Some(value.clone());
         }
 
         None
     }
 }
 
+impl Default for Evaluator {
+    fn default() -> Self {
+        Self::new(Program::default(), Environment::default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    use std::sync::OnceLock;
+
+    use crate::value::{MetaObject, MetaTable};
 
     use super::*;
 
     #[test]
     fn test_eval_integer_expression() {
-        let mut evaluator = Evaluator::new();
+        let mut evaluator = Evaluator::default();
         let expr = Expression::Literal {
             value: Literal::Integer(42),
         };
         let result = evaluator.eval_expression(&expr).unwrap();
-        assert_eq!(result, Value::Integer(42));
+        assert_eq!(result, 42);
     }
 
     #[test]
     fn test_eval_boolean_expression() {
-        let mut evaluator = Evaluator::new();
+        let mut evaluator = Evaluator::default();
         let expr = Expression::Literal {
             value: Literal::Boolean(true),
         };
         let result = evaluator.eval_expression(&expr).unwrap();
-        assert_eq!(result, Value::Boolean(true));
+        assert_eq!(result, true);
     }
 
     #[test]
     fn test_eval_binary_expression() {
-        let mut evaluator = Evaluator::new();
+        let mut evaluator = Evaluator::default();
         let expr = Expression::Binary {
             left: Box::new(Expression::Literal {
                 value: Literal::Integer(2),
@@ -750,12 +843,12 @@ mod tests {
             }),
         };
         let result = evaluator.eval_expression(&expr).unwrap();
-        assert_eq!(result, Value::Integer(5));
+        assert_eq!(result, 5);
     }
 
     #[test]
     fn test_eval_prefix_expression() {
-        let mut evaluator = Evaluator::new();
+        let mut evaluator = Evaluator::default();
         let expr = Expression::Prefix {
             operator: Operator::Minus,
             expression: Box::new(Expression::Literal {
@@ -763,7 +856,7 @@ mod tests {
             }),
         };
         let result = evaluator.eval_expression(&expr).unwrap();
-        assert_eq!(result, Value::Integer(-5));
+        assert_eq!(result, -5);
     }
 
     #[test]
@@ -772,7 +865,7 @@ mod tests {
 
         let result = eval_expr(expr).unwrap();
 
-        assert_eq!(result, Value::Integer(10));
+        assert_eq!(result, 10);
     }
 
     #[test]
@@ -786,7 +879,7 @@ mod tests {
 
         let result = eval(script).unwrap();
 
-        assert_eq!(result, Value::Integer(3));
+        assert_eq!(result, 3);
     }
 
     #[test]
@@ -809,7 +902,7 @@ mod tests {
 
         let result = eval(script).unwrap();
 
-        assert_eq!(result, Value::Integer(55));
+        assert_eq!(result, 55);
     }
 
     #[test]
@@ -824,37 +917,146 @@ mod tests {
 
         let result = eval(script).unwrap();
 
-        assert_eq!(result, Value::Integer(45));
+        assert_eq!(result, 45);
+    }
+
+    #[test]
+    fn test_eval_native_function() {
+        fn fib(n: i64) -> i64 {
+            if n <= 0 {
+                return 0;
+            }
+            if n <= 2 {
+                return 1;
+            }
+            fib(n - 1) + fib(n - 2)
+        }
+
+        let mut env = Environment::new();
+
+        env.define_function("fib", fib);
+
+        let result = Evaluator::eval_expr("fib(10)", env);
+
+        assert_eq!(result.map(|(ret, _)| ret), Ok(55.into()));
+    }
+
+    #[test]
+    fn test_eval_string_object() {
+        let script = r#"
+            s.push("hello");
+            s.push(" world");
+            return s;
+        "#;
+
+        let s = ValueRef::new(Value::new_object(String::new()));
+
+        let mut env = Environment::new();
+
+        env.define("s", s);
+
+        let result = Evaluator::eval_script(script, env);
+
+        assert!(result.is_ok());
+        println!("=> {:?}", result.unwrap());
+    }
+
+    #[test]
+    fn test_eval_object() {
+        #[derive(Debug)]
+        struct Request {
+            headers: HashMap<String, Vec<String>>,
+            body: String,
+        }
+
+        impl Request {
+            fn new() -> Self {
+                Request {
+                    headers: HashMap::new(),
+                    body: "".to_string(),
+                }
+            }
+        }
+
+        impl MetaObject for Request {
+            fn meta_table() -> &'static MetaTable<Self> {
+                static META: OnceLock<MetaTable<Request>> = OnceLock::new();
+                META.get_or_init(|| {
+                    MetaTable::build()
+                        .with_method(
+                            "set_header",
+                            Box::new(|this: &mut Self, args: &[ValueRef]| {
+                                let key = args[0].as_string()?;
+                                let value = args[1].as_string()?;
+
+                                this.headers.insert(key, vec![value]);
+
+                                Ok(None)
+                            }),
+                        )
+                        .with_method(
+                            "add_header",
+                            Box::new(|this: &mut Self, args: &[ValueRef]| {
+                                let key = args[0].as_string()?;
+                                let value = args[1].as_string()?;
+
+                                this.headers.entry(key).or_default().push(value);
+
+                                Ok(None)
+                            }),
+                        )
+                        .fininal()
+                })
+            }
+        }
+
+        let script = r#"
+            req.set_header("Content-Type", "application/json");
+            req.add_header("foo", "bar");
+            req.add_header("foo", "barbar");
+        "#;
+
+        let req = ValueRef::with_object(Box::new(Request::new()));
+
+        let mut env = Environment::new();
+
+        env.define("req", req);
+
+        let result = Evaluator::eval_script(script, env);
+
+        assert!(result.is_ok());
+        let (ret, mut env) = result.unwrap();
+        println!("=> {:?}", env.take("req").take().unwrap().as_object());
     }
 
     #[test]
     fn test_eval() {
         let inputs = vec![
-            ("return 1 + 2 * 3 - 4 / 2 + 5;", Value::Integer(10)),
-            ("let x = 1; return x;", Value::Integer(1)),
-            ("let x = 1; let y = 2; return x + y;", Value::Integer(3)),
+            ("return 1 + 2 * 3 - 4 / 2 + 5;", 10),
+            ("let x = 1; return x;", 1),
+            ("let x = 1; let y = 2; return x + y;", 3),
             (
                 "let sum = 0; for (let i = 0; i < 10; i++) { sum += i; } return sum;",
-                Value::Integer(45),
+                45,
             ),
             (
                 "let sum = 0; for (let i = 0; i < 10; i++) { if (i % 2 == 1) { sum += i; } } return sum;",
-                Value::Integer(25),
+                25,
             ),
             (
                 "let sum = 0; for (let i = 0; i < 10; i++) { if (i % 2 == 1) { sum += i; } if (i == 5) { break; } } return sum;",
-                Value::Integer(9),
+                9,
             ),
             (
                 "let sum = 0; for (let i = 0; i < 10; i++) { if (i % 2 == 0) { continue; } sum += i; } return sum;",
-                Value::Integer(25),
+                25,
             ),
         ];
 
         for (script, ret) in inputs {
-            let result = eval(script);
+            let result = eval(script).unwrap();
 
-            assert_eq!(result, Ok(ret));
+            assert_eq!(result, ret);
         }
     }
 }

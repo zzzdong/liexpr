@@ -168,6 +168,7 @@ impl<'i> Tokenizer<'i> {
                         "else" => Ok(Token::Else),
                         "break" => Ok(Token::Break),
                         "continue" => Ok(Token::Continue),
+                        "null" => Ok(Token::Literal(Literal::Null)),
                         "true" => Ok(Token::Literal(Literal::Boolean(true))),
                         "false" => Ok(Token::Literal(Literal::Boolean(false))),
                         _ => Ok(Token::Identifier(s)),
@@ -176,6 +177,7 @@ impl<'i> Tokenizer<'i> {
                 ch => {
                     if self.starts_with("//") {
                         self.eat_comment();
+                        continue;
                     }
 
                     if let Some(symbol) = self.eat_symbol(ch) {

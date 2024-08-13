@@ -1,12 +1,12 @@
 use std::{
-    any::type_name,
+    any::{type_name, TypeId},
     cell::{Ref, RefCell, RefMut},
     collections::HashMap,
     fmt,
     marker::PhantomData,
     ops::Deref,
     rc::Rc,
-    sync::OnceLock,
+    sync::LazyLock,
 };
 
 #[derive(Debug, Default)]
@@ -47,18 +47,16 @@ impl Value {
         Value::Object(Box::new(object))
     }
 
-    pub fn as_object<T>(&self) -> Option<&T>
+    pub fn into_object<T>(self) -> Option<Box<T>>
     where
         T: Object,
     {
         match self {
-            Value::Object(object) => {
-                if let Some(object) = (object as &dyn std::any::Any).downcast_ref::<T>() {
-                    Some(object)
-                } else {
-                    None
-                }
-            }
+            Value::Object(object) if TypeId::of::<T>() == (object).type_id() => unsafe {
+                let ptr = Box::into_raw(object);
+
+                Some(Box::from_raw(ptr as *mut T))
+            },
             _ => None,
         }
     }
@@ -148,6 +146,15 @@ impl PartialEq<String> for ValueRef {
     }
 }
 
+impl PartialEq<&str> for ValueRef {
+    fn eq(&self, other: &&str) -> bool {
+        match self.borrow().deref() {
+            Value::String(v) => v == other,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValueRef(Rc<RefCell<Value>>);
 
@@ -156,8 +163,8 @@ impl ValueRef {
         ValueRef(Rc::new(RefCell::new(value)))
     }
 
-    pub fn with_object(object: Box<dyn Object>) -> Self {
-        ValueRef(Rc::new(RefCell::new(Value::Object(object))))
+    pub fn with_object(object: impl Object) -> Self {
+        ValueRef::new(Value::new_object(object))
     }
 
     pub fn borrow(&self) -> Ref<'_, Value> {
@@ -170,6 +177,7 @@ impl ValueRef {
 
     pub fn try_downcast_ref<T: 'static>(&self) -> Result<Ref<T>, String> {
         let value = self.0.deref().borrow();
+
         Ref::filter_map(value, |value| match value {
             Value::Object(object) => (object as &dyn std::any::Any).downcast_ref::<T>(),
             _ => None,
@@ -185,13 +193,14 @@ impl ValueRef {
 
     pub fn try_downcast_mut<T: 'static>(&self) -> Result<RefMut<T>, String> {
         let value = self.0.deref().borrow_mut();
+
         RefMut::filter_map(value, |value| match value {
             Value::Object(object) => (object as &mut dyn std::any::Any).downcast_mut::<T>(),
             _ => None,
         })
         .map_err(|_err| {
             format!(
-                "downcart_ref::<{}> failed for {:?}",
+                "downcast_mut::<{}> failed for {:?}",
                 std::any::type_name::<T>(),
                 self
             )
@@ -270,18 +279,18 @@ pub trait Object: std::any::Any + std::fmt::Debug {
             key
         ))
     }
-    fn property_set(&mut self, key: &str, value: ValueRef) -> Result<(), String> {
+    fn property_set(&mut self, key: &str, _value: ValueRef) -> Result<(), String> {
         Err(format!(
             "Unsupport property_set: {}.{}",
             std::any::type_name::<Self>(),
             key
         ))
     }
-    fn call(&self, args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
+    fn call(&self, _args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
         Err(format!("Unsupport call: {}", std::any::type_name::<Self>()))
     }
 
-    fn method_call(&mut self, name: &str, args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
+    fn method_call(&mut self, name: &str, _args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
         Err(format!(
             "Unsupport method_call: {}.{}",
             std::any::type_name::<Self>(),
@@ -289,57 +298,6 @@ pub trait Object: std::any::Any + std::fmt::Debug {
         ))
     }
 }
-
-// #[derive(Debug, Clone, Copy)]
-// pub struct Null;
-
-// impl Object for Null {}
-
-// impl Object for bool {}
-
-// impl Object for i64 {}
-
-// impl Object for f64 {}
-
-// pub struct MetaTable {
-//     name: String,
-//     properties: BTreeMap<String, ValueRef>,
-//     methods: BTreeMap<String, ValueRef>,
-// }
-
-// trait MetaObject {
-//     fn meta_table(&self) -> &MetaTable;
-// }
-
-// impl<T: std::any::Any + std::fmt::Debug + MetaObject> Object for T {
-//     fn property_get(&self, key: &str) -> Result<Option<ValueRef>, String> {
-//         let meta_table = self.meta_table();
-//         for (name, value) in meta_table.properties.iter() {
-//             if name == key {
-//                 return Ok(Some(value.clone()));
-//             }
-//         }
-//         Err(format!(
-//             "Unsupport property_get: {}.{}",
-//             std::any::type_name::<Self>(),
-//             key
-//         ))
-//     }
-
-//     fn method_call(&mut self, name: &str, args: Vec<ValueRef>) -> Result<Option<ValueRef>, String> {
-//         let meta_table = self.meta_table();
-//         for (method_name, method) in meta_table.methods.iter() {
-//             if method_name == name {
-//                 return method.borrow_mut().call(args);
-//             }
-//         }
-//         Err(format!(
-//             "Unsupport method_call: {}.{}",
-//             std::any::type_name::<Self>(),
-//             name
-//         ))
-//     }
-// }
 
 pub struct NativeFunction {
     pub name: String,
@@ -389,6 +347,12 @@ where
 
 pub trait IntoRet {
     fn into_ret(self) -> Result<Option<ValueRef>, String>;
+}
+
+impl IntoRet for () {
+    fn into_ret(self) -> Result<Option<ValueRef>, String> {
+        Ok(None)
+    }
 }
 
 impl<T> IntoRet for T
@@ -490,7 +454,7 @@ where
     F: Fn() -> Ret + Clone + Send + Sync + 'static,
     Ret: IntoRet,
 {
-    fn call(&self, args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
+    fn call(&self, _args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
         self().into_ret()
     }
 }
@@ -569,12 +533,6 @@ impl_callable_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13,
 impl_callable_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16);
  */
 
-// trait Property {
-//     fn name(&self) -> String;
-//     fn getter(&self) -> Result<ValueRef, String>;
-//     fn setter(&self, value: ValueRef) -> Result<(), String>;
-// }
-
 pub trait MetaObject
 where
     Self: Sized,
@@ -588,7 +546,7 @@ where
 {
     fn method_call(&mut self, name: &str, args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
         if let Some(method) = Self::meta_table().methods.get(name) {
-            return (method.func)(self, args);
+            return (method.func).call(self, args);
         }
 
         Err(format!("Method {}.{} not found", type_name::<T>(), name))
@@ -597,7 +555,7 @@ where
     fn property_get(&self, key: &str) -> Result<ValueRef, String> {
         if let Some(property) = Self::meta_table().properties.get(key) {
             if let Some(getter) = &property.getter {
-                return (getter)(self);
+                return (getter).call(self);
             }
         }
 
@@ -611,7 +569,7 @@ where
     fn property_set(&mut self, key: &str, value: ValueRef) -> Result<(), String> {
         if let Some(property) = Self::meta_table().properties.get(key) {
             if let Some(setter) = &property.setter {
-                return (setter)(self, value);
+                return (setter).call(self, value);
             }
         }
 
@@ -625,18 +583,34 @@ where
 
 struct Property<T> {
     name: String,
-    getter: Option<Box<dyn Fn(&T) -> Result<ValueRef, String> + Send + Sync>>,
-    setter: Option<Box<dyn Fn(&mut T, ValueRef) -> Result<(), String> + Send + Sync>>,
+    getter: Option<Box<dyn Getter<T> + Send + Sync>>,
+    setter: Option<Box<dyn Setter<T> + Send + Sync>>,
 }
 
-struct MethodFunction<T> {
+impl<T: fmt::Debug> fmt::Debug for Property<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Property")
+            .field("name", &self.name)
+            .field("getter", &self.getter.is_some())
+            .field("setter", &self.setter.is_some())
+            .finish()
+    }
+}
+
+struct Method<T> {
     name: String,
-    func: Box<dyn Fn(&mut T, &[ValueRef]) -> Result<Option<ValueRef>, String> + Send + Sync>,
+    func: Box<dyn MethodFunction<T> + Send + Sync>,
+}
+
+impl<T: fmt::Debug> fmt::Debug for Method<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Method").field("name", &self.name).finish()
+    }
 }
 
 pub struct MetaTable<T> {
     properties: HashMap<String, Property<T>>,
-    methods: HashMap<String, MethodFunction<T>>,
+    methods: HashMap<String, Method<T>>,
 }
 
 impl<T> Default for MetaTable<T> {
@@ -678,33 +652,66 @@ impl<T> MetaTableBuilder<T> {
         }
     }
 
-    pub fn with_property(
+    pub fn with_property<Arg: 'static>(
         mut self,
         name: impl ToString,
-        getter: Option<Box<dyn Fn(&T) -> Result<ValueRef, String> + Send + Sync>>,
-        setter: Option<Box<dyn Fn(&mut T, ValueRef) -> Result<(), String> + Send + Sync>>,
+        getter: impl GetterCallable<T> + 'static,
+        setter: impl SetterCallable<T, Arg> + 'static,
     ) -> Self {
         self.inner.properties.insert(
             name.to_string(),
             Property {
                 name: name.to_string(),
-                getter,
-                setter,
+                getter: Some(Box::new(getter.into_function()) as Box<dyn Getter<T> + Send + Sync>),
+                setter: Some(Box::new(setter.into_function()) as Box<dyn Setter<T> + Send + Sync>),
             },
         );
         self
     }
 
-    pub fn with_method(
+    pub fn with_getter_only(
         mut self,
         name: impl ToString,
-        func: impl Fn(&mut T, &[ValueRef]) -> Result<Option<ValueRef>, String> + Send + Sync + 'static,
+        getter: impl GetterCallable<T> + 'static,
+    ) -> Self {
+        self.inner.properties.insert(
+            name.to_string(),
+            Property {
+                name: name.to_string(),
+                getter: Some(Box::new(getter.into_function()) as Box<dyn Getter<T> + Send + Sync>),
+                setter: None,
+            },
+        );
+        self
+    }
+
+    pub fn with_setter_only<Arg: 'static>(
+        mut self,
+        name: impl ToString,
+        setter: impl SetterCallable<T, Arg> + 'static,
+    ) -> Self {
+        self.inner.properties.insert(
+            name.to_string(),
+            Property {
+                name: name.to_string(),
+                getter: None,
+                setter: Some(Box::new(setter.into_function()) as Box<dyn Setter<T> + Send + Sync>),
+            },
+        );
+
+        self
+    }
+
+    pub fn with_method<Args: 'static>(
+        mut self,
+        name: impl ToString,
+        func: impl MethodCallable<T, Args>,
     ) -> Self {
         self.inner.methods.insert(
             name.to_string(),
-            MethodFunction {
+            Method {
                 name: name.to_string(),
-                func: Box::new(func),
+                func: Box::new(func.into_function()),
             },
         );
         self
@@ -715,87 +722,238 @@ impl<T> MetaTableBuilder<T> {
     }
 }
 
+static BOOLEAN_METATABLE: LazyLock<MetaTable<bool>> = LazyLock::new(|| {
+    MetaTable::build()
+        .with_method("to_string", |this: &mut bool| this.to_string())
+        .fininal()
+});
+
+static INTEGER_METATABLE: LazyLock<MetaTable<i64>> = LazyLock::new(|| {
+    MetaTable::build()
+        .with_method("to_string", |this: &mut i64| Ok(this.to_string()))
+        .with_method("abs", |this: &mut i64| Ok(this.abs()))
+        .fininal()
+});
+
+static FLOAT_METATABLE: LazyLock<MetaTable<f64>> = LazyLock::new(|| {
+    MetaTable::build()
+        .with_method("to_string", |this: &mut f64| Ok(this.to_string()))
+        .with_method("abs", |this: &mut f64| Ok(this.abs()))
+        .fininal()
+});
+
+static STRING_METATABLE: LazyLock<MetaTable<String>> = LazyLock::new(|| {
+    MetaTable::build()
+        .with_method(
+            "len",
+            Box::new(|this: &mut String| Ok(this.chars().count() as i64)),
+        )
+        .with_method("starts_with", |this: &mut String, pat: String| {
+            this.starts_with(&pat)
+        })
+        .with_method("ends_with", |this: &mut String, pat: String| {
+            this.ends_with(&pat)
+        })
+        .with_method("push", |this: &mut String, other: String| {
+            this.push_str(&other);
+        })
+        .fininal()
+});
+
+impl MetaObject for bool {
+    fn meta_table() -> &'static MetaTable<Self> {
+        &BOOLEAN_METATABLE
+    }
+}
+
+impl MetaObject for i64 {
+    fn meta_table() -> &'static MetaTable<Self> {
+        &INTEGER_METATABLE
+    }
+}
+
+impl MetaObject for f64 {
+    fn meta_table() -> &'static MetaTable<Self> {
+        &FLOAT_METATABLE
+    }
+}
+
 impl MetaObject for String {
     fn meta_table() -> &'static MetaTable<Self> {
-        static STRING_META: OnceLock<MetaTable<String>> = OnceLock::new();
-        STRING_META.get_or_init(|| {
-            MetaTable::build()
-                .with_method(
-                    "len",
-                    Box::new(|this: &mut String, args: &[ValueRef]| {
-                        if !args.is_empty() {
-                            return Err(format!(
-                                "Invalid argument for {}.{}",
-                                type_name::<Self>(),
-                                "len"
-                            ));
-                        }
-                        Ok(Some(Value::Integer(this.len() as i64).into()))
-                    }),
-                )
-                .with_method(
-                    "starts_with",
-                    Box::new(|this: &mut String, args: &[ValueRef]| {
-                        let arg = args.first().ok_or(format!(
-                            "Invalid argument for {}.{}",
-                            type_name::<Self>(),
-                            "starts_with"
-                        ))?;
-                        let arg = arg.borrow();
-                        match arg.deref() {
-                            Value::String(s) => {
-                                Ok(Some(Value::Boolean(this.starts_with(s)).into()))
-                            }
-                            _ => Err(format!(
-                                "Invalid argument for {}.{}",
-                                type_name::<Self>(),
-                                "starts_with"
-                            )),
-                        }
-                    }),
-                )
-                .with_method(
-                    "ends_with",
-                    Box::new(|this: &mut String, args: &[ValueRef]| {
-                        let arg = args.first().ok_or(format!(
-                            "Invalid argument for {}.{}",
-                            type_name::<Self>(),
-                            "ends_with"
-                        ))?;
-                        let arg = arg.borrow();
-                        match arg.deref() {
-                            Value::String(s) => Ok(Some(Value::Boolean(this.ends_with(s)).into())),
-                            _ => Err(format!(
-                                "Invalid argument for {}.{}",
-                                type_name::<Self>(),
-                                "ends_with"
-                            )),
-                        }
-                    }),
-                )
-                .with_method(
-                    "push",
-                    Box::new(|this: &mut String, args: &[ValueRef]| {
-                        let arg = args.first().ok_or(format!(
-                            "Invalid argument for {}.{}",
-                            type_name::<Self>(),
-                            "push"
-                        ))?;
-                        let arg = arg.borrow();
-                        match arg.deref() {
-                            Value::String(s) => {
-                                this.push_str(s);
-                                Ok(None)
-                            }
-                            _ => Err(format!(
-                                "Invalid argument for {}.{}",
-                                type_name::<Self>(),
-                                "push"
-                            )),
-                        }
-                    }),
-                )
-                .fininal()
-        })
+        &STRING_METATABLE
+    }
+}
+
+/// A method function that can be called on a value.
+pub trait MethodFunction<T>: Send + 'static {
+    fn call(&self, this: &mut T, args: &[ValueRef]) -> Result<Option<ValueRef>, String>;
+}
+
+impl<T, F, Args> MethodFunction<T> for IntoFunction<F, Args>
+where
+    F: MethodCallable<T, Args> + Clone,
+    Args: 'static,
+{
+    fn call(&self, this: &mut T, args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
+        self.func.call(this, args)
+    }
+}
+
+pub trait MethodCallable<T, Args>: Clone + Send + Sync + Sized + 'static {
+    fn call(&self, this: &mut T, args: &[ValueRef]) -> Result<Option<ValueRef>, String>;
+
+    fn into_function(self) -> IntoFunction<Self, Args> {
+        IntoFunction {
+            func: self,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T, F, Ret> MethodCallable<T, &[ValueRef]> for F
+where
+    F: Fn(&mut T, &[ValueRef]) -> Ret + Clone + Send + Sync + 'static,
+    Ret: IntoRet,
+{
+    fn call(&self, this: &mut T, args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
+        (self)(this, args).into_ret()
+    }
+}
+
+impl<T, F, Ret> MethodCallable<T, ()> for F
+where
+    F: Fn(&mut T) -> Ret + Clone + Send + Sync + 'static,
+    Ret: IntoRet,
+{
+    fn call(&self, this: &mut T, _args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
+        self(this).into_ret()
+    }
+}
+
+macro_rules! impl_method_callable {
+    ($($idx: expr => $arg: ident),+) => {
+        #[allow(non_snake_case)]
+        impl<T, F, Ret, $($arg,)*> MethodCallable<T, ($($arg,)*)> for F
+        where
+            F: Fn(&mut T, $($arg,)*) -> Ret + Clone + Send + Sync + 'static,
+            Ret: IntoRet,
+            $( $arg: FromValue + 'static, )*
+        {
+            fn call(&self,this: &mut T, args: &[ValueRef]) -> Result<Option<ValueRef>, String> {
+                $(
+                    let $arg = <$arg>::from_value(args.get($idx).ok_or(format!("Invalid argument {}", $idx))?)?;
+                )*
+                (self)(this, $($arg,)*).into_ret()
+            }
+        }
+    }
+}
+
+impl_method_callable!(0=>Arg0);
+impl_method_callable!(0=>Arg0, 1=>Arg1);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7, 8=>Arg8);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7, 8=>Arg8, 9=>Arg9);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7, 8=>Arg8, 9=>Arg9, 10=>Arg10);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7, 8=>Arg8, 9=>Arg9, 10=>Arg10, 11=>Arg11);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7, 8=>Arg8, 9=>Arg9, 10=>Arg10, 11=>Arg11, 12=>Arg12);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7, 8=>Arg8, 9=>Arg9, 10=>Arg10, 11=>Arg11, 12=>Arg12, 13=>Arg13);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7, 8=>Arg8, 9=>Arg9, 10=>Arg10, 11=>Arg11, 12=>Arg12, 13=>Arg13, 14=>Arg14);
+impl_method_callable!(0=>Arg0, 1=>Arg1, 2=>Arg2, 3=>Arg3, 4=>Arg4, 5=>Arg5, 6=>Arg6, 7=>Arg7, 8=>Arg8, 9=>Arg9, 10=>Arg10, 11=>Arg11, 12=>Arg12, 13=>Arg13, 14=>Arg14, 15=>Arg15);
+
+pub trait IntoValueRet {
+    fn into_ret(self) -> Result<ValueRef, String>;
+}
+
+impl<T: Into<ValueRef>> IntoValueRet for T {
+    fn into_ret(self) -> Result<ValueRef, String> {
+        Ok(self.into())
+    }
+}
+
+pub trait Getter<T>: Send + 'static {
+    fn call(&self, this: &T) -> Result<ValueRef, String>;
+}
+
+impl<T, F, Args> Getter<T> for IntoFunction<F, Args>
+where
+    F: GetterCallable<T> + Clone,
+    Args: 'static,
+{
+    fn call(&self, this: &T) -> Result<ValueRef, String> {
+        self.func.call(this)
+    }
+}
+
+pub trait GetterCallable<T>: Clone + Send + Sync + Sized + 'static {
+    fn call(&self, this: &T) -> Result<ValueRef, String>;
+
+    fn into_function(self) -> IntoFunction<Self, ()> {
+        IntoFunction {
+            func: self,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T, F, Ret> GetterCallable<T> for F
+where
+    F: Fn(&T) -> Ret + Clone + Send + Sync + 'static,
+    Ret: IntoValueRet,
+{
+    fn call(&self, this: &T) -> Result<ValueRef, String> {
+        self(this).into_ret()
+    }
+}
+
+pub trait Setter<T>: Send + 'static {
+    fn call(&self, this: &mut T, value: ValueRef) -> Result<(), String>;
+}
+
+pub trait IntoVoidRet {
+    fn into_ret(self) -> Result<(), String>;
+}
+
+impl IntoVoidRet for () {
+    fn into_ret(self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl<T, F, Args> Setter<T> for IntoFunction<F, Args>
+where
+    F: SetterCallable<T, Args> + Clone,
+    Args: 'static,
+{
+    fn call(&self, this: &mut T, value: ValueRef) -> Result<(), String> {
+        self.func.call(this, value)
+    }
+}
+
+pub trait SetterCallable<T, Args>: Clone + Send + Sync + Sized + 'static {
+    fn call(&self, this: &mut T, value: ValueRef) -> Result<(), String>;
+
+    fn into_function(self) -> IntoFunction<Self, Args> {
+        IntoFunction {
+            func: self,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T, F, V, Ret> SetterCallable<T, V> for F
+where
+    F: Fn(&mut T, V) -> Ret + Clone + Send + Sync + 'static,
+    V: FromValue,
+    Ret: IntoVoidRet,
+{
+    fn call(&self, this: &mut T, value: ValueRef) -> Result<(), String> {
+        let v = V::from_value(&value)?;
+        self(this, v).into_ret()
     }
 }

@@ -341,8 +341,6 @@ fn eval_binary_expression(
     operator: &Operator,
     right: &Expression,
 ) -> Result<ValueRef, String> {
-    let rhs = eval_expression(ctx, right)?;
-
     match operator {
         Operator::Plus
         | Operator::Minus
@@ -357,6 +355,7 @@ fn eval_binary_expression(
         | Operator::LessEqual
         | Operator::LogicalAnd
         | Operator::LogicalOr => {
+            let rhs = eval_expression(ctx, right)?;
             let lhs = eval_expression(ctx, left)?;
             let lhs = lhs.borrow();
             let rhs = rhs.borrow();
@@ -364,89 +363,116 @@ fn eval_binary_expression(
         }
         Operator::Assign => match left {
             Expression::Variable { name } => {
+                let rhs = eval_expression(ctx, right)?;
                 ctx.set_variable(name, rhs)?;
                 Ok(Value::Null.into())
             }
+            Expression::Binary {
+                left: object,
+                operator,
+                right: prop,
+            } if operator == &Operator::Access => match prop.deref() {
+                Expression::Variable { name } => {
+                    let mut lhs = eval_expression(ctx, object)?;
+                    let mut lhs = lhs.borrow_mut();
+                    let lhs = lhs.deref_mut();
+                    let value = eval_expression(ctx, right)?;
+                    match lhs {
+                        Value::Object(obj) => {
+                            obj.property_set(name, value)?;
+                            Ok(Value::Null.into())
+                        }
+                        _ => Err(format!("Invalid assignment: {:?} = {:?}", left, right)),
+                    }
+                }
+                _ => Err(format!("Invalid assignment: {:?} = {:?}", left, right)),
+            },
             _ => Err(format!("Invalid assignment: {:?} = {:?}", left, right)),
         },
 
-        Operator::PlusAssign => match left {
-            Expression::Variable { name } => {
-                let mut value = ctx
-                    .get_variable(name)
-                    .ok_or(format!("Variable not found: {}", name))?;
-                let rhs = rhs.borrow();
+        Operator::PlusAssign => {
+            let mut lhs = eval_expression(ctx, left)?;
+            let rhs = eval_expression(ctx, right)?;
 
-                let ret = eval_binop(ctx, &Operator::Plus, value.borrow().deref(), rhs.deref())?;
+            let mut lhs = lhs.borrow_mut();
+            let lhs = lhs.deref_mut();
 
-                *value.borrow_mut() = ret;
-                Ok(Value::Null.into())
+            let ret = eval_binop(ctx, &Operator::Plus, lhs, &rhs.borrow())?;
+
+            *lhs = ret;
+
+            Ok(Value::Null.into())
+        }
+
+        Operator::MinusAssign => {
+            let mut lhs = eval_expression(ctx, left)?;
+            let rhs = eval_expression(ctx, right)?;
+
+            let mut lhs = lhs.borrow_mut();
+            let lhs = lhs.deref_mut();
+
+            let ret = eval_binop(ctx, &Operator::Minus, lhs, &rhs.borrow())?;
+
+            *lhs = ret;
+
+            Ok(Value::Null.into())
+        }
+        Operator::MultiplyAssign => {
+            let mut lhs = eval_expression(ctx, left)?;
+            let rhs = eval_expression(ctx, right)?;
+
+            let mut lhs = lhs.borrow_mut();
+            let lhs = lhs.deref_mut();
+
+            let ret = eval_binop(ctx, &Operator::Multiply, lhs, &rhs.borrow())?;
+
+            *lhs = ret;
+
+            Ok(Value::Null.into())
+        }
+        Operator::DivideAssign => {
+            let mut lhs = eval_expression(ctx, left)?;
+            let rhs = eval_expression(ctx, right)?;
+
+            let mut lhs = lhs.borrow_mut();
+            let lhs = lhs.deref_mut();
+
+            let ret = eval_binop(ctx, &Operator::Divide, lhs, &rhs.borrow())?;
+
+            *lhs = ret;
+
+            Ok(Value::Null.into())
+        }
+        Operator::ModuloAssign => {
+            let mut lhs = eval_expression(ctx, left)?;
+            let rhs = eval_expression(ctx, right)?;
+
+            let mut lhs = lhs.borrow_mut();
+            let lhs = lhs.deref_mut();
+
+            let ret = eval_binop(ctx, &Operator::Modulo, lhs, &rhs.borrow())?;
+
+            *lhs = ret;
+
+            Ok(Value::Null.into())
+        }
+        Operator::Access => {
+            let lhs = eval_expression(ctx, left)?;
+            match right {
+                Expression::Variable { name } => {
+                    let lhs = lhs.borrow();
+                    let lhs = lhs.deref();
+                    match lhs {
+                        Value::Object(obj) => {
+                            let value = obj.property_get(name)?;
+                            Ok(value)
+                        }
+                        _ => Err(format!("Invalid access: {:?}.{:?}", left, right)),
+                    }
+                }
+                _ => Err(format!("Invalid access: {:?}.{:?}", left, right)),
             }
-            _ => Err(format!("Invalid assignment: {:?} += {:?}", left, right)),
-        },
-
-        Operator::MinusAssign => match left {
-            Expression::Variable { name } => {
-                let mut value = ctx
-                    .get_variable(name)
-                    .ok_or(format!("Variable not found: {}", name))?;
-                let rhs = rhs.borrow();
-
-                let ret = eval_binop(ctx, &Operator::Minus, value.borrow().deref(), rhs.deref())?;
-
-                *value.borrow_mut() = ret;
-                Ok(Value::Null.into())
-            }
-            _ => Err(format!("Invalid assignment: {:?} -= {:?}", left, right)),
-        },
-        Operator::MultiplyAssign => match left {
-            Expression::Variable { name } => {
-                let mut value = ctx
-                    .get_variable(name)
-                    .ok_or(format!("Variable not found: {}", name))?;
-                let rhs = rhs.borrow();
-
-                let ret = eval_binop(
-                    ctx,
-                    &Operator::Multiply,
-                    value.borrow().deref(),
-                    rhs.deref(),
-                )?;
-
-                *value.borrow_mut() = ret;
-                Ok(Value::Null.into())
-            }
-            _ => Err(format!("Invalid assignment: {:?} *= {:?}", left, right)),
-        },
-        Operator::DivideAssign => match left {
-            Expression::Variable { name } => {
-                let mut value = ctx
-                    .get_variable(name)
-                    .ok_or(format!("Variable not found: {}", name))?;
-                let rhs = rhs.borrow();
-
-                let ret = eval_binop(ctx, &Operator::Divide, value.borrow().deref(), rhs.deref())?;
-
-                *value.borrow_mut() = ret;
-                Ok(Value::Null.into())
-            }
-            _ => Err(format!("Invalid assignment: {:?} /= {:?}", left, right)),
-        },
-        Operator::ModuloAssign => match left {
-            Expression::Variable { name } => {
-                let mut value = ctx
-                    .get_variable(name)
-                    .ok_or(format!("Variable not found: {}", name))?;
-                let rhs = rhs.borrow();
-
-                let ret = eval_binop(ctx, &Operator::Modulo, value.borrow().deref(), rhs.deref())?;
-
-                *value.borrow_mut() = ret;
-                Ok(Value::Null.into())
-            }
-            _ => Err(format!("Invalid assignment: {:?} %= {:?}", left, right)),
-        },
-
+        }
         _ => Err(format!(
             "Unsupported binary operation: {:?} {} {:?}",
             left, operator, right
@@ -488,38 +514,28 @@ fn eval_postfix_expression(
     expression: &Expression,
 ) -> Result<ValueRef, String> {
     match operator {
-        Operator::Increase => match expression {
-            Expression::Variable { name } => {
-                let mut value = ctx
-                    .get_variable(name)
-                    .ok_or(format!("Variable not found: {}", name))?;
-                let mut value = value.borrow_mut();
-                match value.deref_mut() {
-                    Value::Integer(i) => {
-                        *i += 1;
-                        Ok(Value::Null.into())
-                    }
-                    _ => Err(format!("Invalidpostfix operation: {:?}++", expression)),
+        Operator::Increase => {
+            let mut val = eval_expression(ctx, expression)?;
+            let mut val = val.borrow_mut();
+            match val.deref_mut() {
+                Value::Integer(i) => {
+                    *i += 1;
+                    Ok(Value::Null.into())
                 }
+                _ => Err(format!("Invalid postfix operation: {:?}++", expression)),
             }
-            _ => Err(format!("Invalid postfix operation: {:?}++", expression)),
-        },
-        Operator::Decrease => match expression {
-            Expression::Variable { name } => {
-                let mut value = ctx
-                    .get_variable(name)
-                    .ok_or(format!("Variable not found: {}", name))?;
-                let mut value = value.borrow_mut();
-                match value.deref_mut() {
-                    Value::Integer(i) => {
-                        *i -= 1;
-                        Ok(Value::Null.into())
-                    }
-                    _ => Err(format!("Invalid postfixoperation: {:?}--", expression)),
+        }
+        Operator::Decrease => {
+            let mut val = eval_expression(ctx, expression)?;
+            let mut val = val.borrow_mut();
+            match val.deref_mut() {
+                Value::Integer(i) => {
+                    *i -= 1;
+                    Ok(Value::Null.into())
                 }
+                _ => Err(format!("Invalid postfix operation: {:?}--", expression)),
             }
-            _ => Err(format!("Invalid postfix operation: {:?}--", expression)),
-        },
+        }
         _ => Err(format!(
             "Unsupported postfix operation: {} {:?}",
             operator, expression
@@ -579,6 +595,7 @@ fn eval_call_expression(
                     match value.deref() {
                         Value::UserFunction(func) => eval_call_function(ctx, func, args),
                         Value::Object(obj) => eval_object_call(ctx, obj.as_ref(), args),
+
                         _ => Err(format!(
                             "Invalid call operation: {:?}({:?})",
                             expression, args
@@ -597,20 +614,19 @@ fn eval_call_expression(
             right,
         } if operator == &Operator::Access => {
             let mut left = eval_expression(ctx, left)?;
-
+            let mut lhs = left.borrow_mut();
             match &**right {
-                Expression::Variable { name } => {
-                    let mut left = left.borrow_mut();
-                    match left.deref_mut() {
-                        Value::Object(obj) => {
-                            eval_object_method_call(ctx, obj.as_mut(), name, args)
-                        }
-                        _ => Err(format!(
-                            "Invalid call operation: {:?}({:?})",
-                            expression, args
-                        )),
-                    }
-                }
+                Expression::Variable { name } => match lhs.deref_mut() {
+                    Value::Boolean(value) => eval_object_method_call(ctx, value, name, args),
+                    Value::Integer(value) => eval_object_method_call(ctx, value, name, args),
+                    Value::Float(value) => eval_object_method_call(ctx, value, name, args),
+                    Value::String(value) => eval_object_method_call(ctx, value, name, args),
+                    Value::Object(obj) => eval_object_method_call(ctx, obj.as_mut(), name, args),
+                    _ => Err(format!(
+                        "Invalid call operation: {:?}({:?})",
+                        expression, args
+                    )),
+                },
                 _ => Err(format!(
                     "Invalid call operation: {:?}({:?})",
                     expression, args
@@ -830,7 +846,7 @@ impl Evaluator {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::OnceLock;
+    use std::sync::LazyLock;
 
     use crate::value::{MetaObject, MetaTable};
 
@@ -968,23 +984,22 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_string_object() {
+    fn test_eval_string() {
         let script = r#"
             s.push("hello");
             s.push(" world");
             return s;
         "#;
 
-        let s = ValueRef::new(Value::new_object(String::new()));
+        let s = ValueRef::new(Value::new_string(""));
 
         let mut env = Environment::new();
 
         env.define("s", s);
 
-        let result = Evaluator::eval_script(script, &mut Context::new(env));
+        let result = Evaluator::eval_script(script, &mut Context::new(env)).unwrap();
 
-        assert!(result.is_ok());
-        println!("=> {:?}", result.unwrap());
+        assert_eq!(result, "hello world".to_string())
     }
 
     #[test]
@@ -1006,61 +1021,59 @@ mod tests {
 
         impl MetaObject for Request {
             fn meta_table() -> &'static MetaTable<Self> {
-                static META: OnceLock<MetaTable<Request>> = OnceLock::new();
-                META.get_or_init(|| {
+                static META: LazyLock<MetaTable<Request>> = LazyLock::new(|| {
                     MetaTable::build()
                         .with_method(
                             "set_header",
-                            Box::new(|this: &mut Self, args: &[ValueRef]| {
-                                let key = args[0].as_string()?;
-                                let value = args[1].as_string()?;
-
-                                this.headers.insert(key, vec![value]);
-
-                                Ok(None)
-                            }),
+                            |this: &mut Request, name: String, value: String| {
+                                this.headers.insert(name, vec![value]);
+                            },
                         )
                         .with_method(
                             "add_header",
-                            Box::new(|this: &mut Self, args: &[ValueRef]| {
-                                let key = args[0].as_string()?;
-                                let value = args[1].as_string()?;
-
-                                this.headers.entry(key).or_default().push(value);
-
-                                Ok(None)
-                            }),
+                            |this: &mut Request, name: String, value: String| {
+                                this.headers.entry(name).or_default().push(value);
+                            },
+                        )
+                        .with_property(
+                            "body",
+                            |this: &Request| this.body.clone(),
+                            |this: &mut Request, body: String| {
+                                this.body = body;
+                            },
                         )
                         .fininal()
-                })
+                });
+
+                &META
             }
         }
 
         let script = r#"
-            req.set_header("Content-Type", "application/json");
-            req.add_header("foo", "bar");
-            req.add_header("foo", "barbar");
+            request.set_header("Content-Type", "application/json");
+            request.add_header("foo", "bar");
+            request.add_header("foo", "barbar");
+            request.body = "ok";
+
+            return request.body;
         "#;
 
-        let req = ValueRef::with_object(Box::new(Request::new()));
+        let req = ValueRef::with_object(Request::new());
 
         let mut env = Environment::new();
 
-        env.define("req", req);
+        env.define("request", req);
 
         let mut ctx = Context::new(env);
 
-        let result = Evaluator::eval_script(script, &mut ctx);
+        let result = Evaluator::eval_script(script, &mut ctx).unwrap();
 
-        assert!(result.is_ok());
-        println!(
-            "=> {:?}",
-            ctx.into_environment()
-                .take("req")
-                .take()
-                .unwrap()
-                .as_object::<Request>()
-        );
+        assert_eq!(result, "ok");
+
+        let req = ctx.into_environment().take("request").unwrap();
+        let req = req.into_object::<Request>().unwrap();
+
+        assert_eq!(req.body, "ok");
     }
 
     #[test]
@@ -1085,6 +1098,7 @@ mod tests {
                 "let sum = 0; for (let i = 0; i < 10; i++) { if (i % 2 == 0) { continue; } sum += i; } return sum;",
                 25,
             ),
+            (r#"return "hello".len();"#, 5),
         ];
 
         for (script, ret) in inputs {

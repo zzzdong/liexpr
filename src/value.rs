@@ -68,15 +68,42 @@ impl From<bool> for Value {
     }
 }
 
-impl From<i64> for Value {
-    fn from(value: i64) -> Self {
-        Value::new_integer(value)
+macro_rules! impl_from_integer_for_value {
+    ($t: ty) => {
+        impl From<$t> for Value {
+            fn from(value: $t) -> Self {
+                Value::new_integer(value as i64)
+            }
+        }
+    };
+}
+
+impl_from_integer_for_value!(i8);
+impl_from_integer_for_value!(u8);
+impl_from_integer_for_value!(i16);
+impl_from_integer_for_value!(u16);
+impl_from_integer_for_value!(i32);
+impl_from_integer_for_value!(u32);
+impl_from_integer_for_value!(i64);
+impl_from_integer_for_value!(u64);
+impl_from_integer_for_value!(isize);
+impl_from_integer_for_value!(usize);
+
+impl From<f32> for Value {
+    fn from(value: f32) -> Self {
+        Value::new_float(value as f64)
     }
 }
 
 impl From<f64> for Value {
     fn from(value: f64) -> Self {
         Value::new_float(value)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        Value::new_string(value)
     }
 }
 
@@ -401,11 +428,35 @@ impl FromValue for bool {
     }
 }
 
-impl FromValue for i64 {
-    fn from_value(value: &ValueRef) -> Result<i64, String> {
+macro_rules! impl_from_value_for_integer {
+    ($t: ty) => {
+        impl FromValue for $t {
+            fn from_value(value: &ValueRef) -> Result<$t, String> {
+                match value.borrow().deref() {
+                    Value::Integer(i) => Ok(*i as $t),
+                    _ => Err(format!("Can not convert {:?} to i64", value)),
+                }
+            }
+        }
+    };
+}
+
+impl_from_value_for_integer!(i8);
+impl_from_value_for_integer!(i16);
+impl_from_value_for_integer!(i32);
+impl_from_value_for_integer!(i64);
+impl_from_value_for_integer!(isize);
+impl_from_value_for_integer!(u8);
+impl_from_value_for_integer!(u16);
+impl_from_value_for_integer!(u32);
+impl_from_value_for_integer!(u64);
+impl_from_value_for_integer!(usize);
+
+impl FromValue for f32 {
+    fn from_value(value: &ValueRef) -> Result<f32, String> {
         match value.borrow().deref() {
-            Value::Integer(i) => Ok(*i),
-            _ => Err(format!("Can not convert {:?} to i64", value)),
+            Value::Float(f) => Ok(*f as f32),
+            _ => Err(format!("Can not convert {:?} to f64", value)),
         }
     }
 }

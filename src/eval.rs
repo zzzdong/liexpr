@@ -16,11 +16,12 @@ use crate::{
 /// # Example
 ///
 /// ```
-/// # use liexpr::{eval, Value};
-/// assert_eq!(eval("let x = 5; return x + 1;"), Ok(6.into()));
+/// # use liexpr::{eval, Context, Value};
+/// assert_eq!(eval("let x = 5; return x + 1;", &mut Context::default()), Ok(6.into()));
 /// ```
-pub fn eval(script: &str) -> Result<ValueRef, String> {
-    Evaluator::eval_script(script, &mut Context::default())
+pub fn eval(script: &str, ctx: &mut Context) -> Result<ValueRef, String> {
+    let program = Parser::parse_program(script)?;
+    eval_program(ctx, &program)
 }
 
 /// Eval expression.
@@ -28,11 +29,12 @@ pub fn eval(script: &str) -> Result<ValueRef, String> {
 /// # Example
 ///
 /// ```
-/// # use liexpr::{eval_expr, Value};
-/// assert_eq!(eval_expr("1 + 2 * 3 - 4"), Ok(3.into()));
+/// # use liexpr::{eval_expr, Context, Value};
+/// assert_eq!(eval_expr("1 + 2 * 3 - 4", &mut Context::default()), Ok(3.into()));
 /// ```
-pub fn eval_expr(expr: &str) -> Result<ValueRef, String> {
-    Evaluator::eval_expression(expr, &mut Context::default())
+pub fn eval_expr(expr: &str, ctx: &mut Context) -> Result<ValueRef, String> {
+    let expr = Parser::parse_expression(expr)?;
+    eval_expression(ctx, &expr)
 }
 
 #[derive(Debug)]
@@ -41,7 +43,7 @@ pub struct Environment {
 }
 
 impl Environment {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             variables: HashMap::new(),
         }
@@ -174,7 +176,7 @@ pub enum ControlFlow {
 }
 
 fn eval_binop(
-    ctx: &mut Context,
+    _ctx: &mut Context,
     operator: &Operator,
     lhs: &Value,
     rhs: &Value,
@@ -481,7 +483,7 @@ fn eval_binary_expression(
 }
 
 fn eval_prefix_expression(
-    ctx: &mut Context,
+    _ctx: &mut Context,
     operator: &Operator,
     expression: &Expression,
 ) -> Result<ValueRef, String> {
@@ -828,21 +830,6 @@ pub fn eval_program(ctx: &mut Context, program: &Program) -> Result<ValueRef, St
     Ok(Value::Null.into())
 }
 
-#[derive(Debug)]
-struct Evaluator {}
-
-impl Evaluator {
-    pub fn eval_script(script: &str, ctx: &mut Context) -> Result<ValueRef, String> {
-        let program = Parser::parse_program(script)?;
-        eval_program(ctx, &program)
-    }
-
-    pub fn eval_expression(script: &str, ctx: &mut Context) -> Result<ValueRef, String> {
-        let expr = Parser::parse_expression(script)?;
-        eval_expression(ctx, &expr)
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -905,7 +892,7 @@ mod tests {
     fn test_eval_expression() {
         let expr = "1 + 2 * 3 - 4 / 2 + 5";
 
-        let result = eval_expr(expr).unwrap();
+        let result = eval_expr(expr, &mut Context::default()).unwrap();
 
         assert_eq!(result, 10);
     }
@@ -919,7 +906,7 @@ mod tests {
             return sum(1, 2);
         ";
 
-        let result = eval(script).unwrap();
+        let result = eval(script, &mut Context::default()).unwrap();
 
         assert_eq!(result, 3);
     }
@@ -942,7 +929,7 @@ mod tests {
             return f(10);
         ";
 
-        let result = eval(script).unwrap();
+        let result = eval(script, &mut Context::default()).unwrap();
 
         assert_eq!(result, 55);
     }
@@ -957,7 +944,7 @@ mod tests {
             return sum;
         ";
 
-        let result = eval(script).unwrap();
+        let result = eval(script, &mut Context::default()).unwrap();
 
         assert_eq!(result, 45);
     }
@@ -978,7 +965,7 @@ mod tests {
 
         env.define_function("fib", fib);
 
-        let result = Evaluator::eval_expression("fib(10)", &mut Context::new(env));
+        let result = eval_expr("fib(10)", &mut Context::new(env));
 
         assert_eq!(result, Ok(55.into()));
     }
@@ -997,7 +984,7 @@ mod tests {
 
         env.define("s", s);
 
-        let result = Evaluator::eval_script(script, &mut Context::new(env)).unwrap();
+        let result = eval(script, &mut Context::new(env)).unwrap();
 
         assert_eq!(result, "hello world".to_string())
     }
@@ -1066,7 +1053,7 @@ mod tests {
 
         let mut ctx = Context::new(env);
 
-        let result = Evaluator::eval_script(script, &mut ctx).unwrap();
+        let result = eval(script, &mut ctx).unwrap();
 
         assert_eq!(result, "ok");
 
@@ -1102,7 +1089,7 @@ mod tests {
         ];
 
         for (script, ret) in inputs {
-            let result = eval(script).unwrap();
+            let result = eval(script, &mut Context::default()).unwrap();
 
             assert_eq!(result, ret);
         }

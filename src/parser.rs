@@ -192,8 +192,8 @@ impl Parser {
         let initializer = self.parse_statement()?;
         match &initializer {
             Statement::Empty => {}
-            Statement::Let { name, value } => {}
-            Statement::Expression { expression } => {}
+            Statement::Let { .. } => {}
+            Statement::Expression { .. } => {}
             _ => {
                 return Err(format!(
                     "Unexpected initializer statement: {:?}",

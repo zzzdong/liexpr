@@ -17,11 +17,11 @@ use crate::{
 ///
 /// ```
 /// # use liexpr::{eval, Context, Value};
-/// assert_eq!(eval("let x = 5; return x + 1;", &mut Context::default()), Ok(6.into()));
+/// assert_eq!(eval("let x = 5; return x + 1;", &mut Environment::default()), Ok(6.into()));
 /// ```
-pub fn eval(script: &str, ctx: &mut Context) -> Result<ValueRef, String> {
+pub fn eval(script: &str, environment: &mut Environment) -> Result<ValueRef, String> {
     let program = Parser::parse_program(script)?;
-    eval_program(ctx, &program)
+    eval_program(&mut Context::new(environment), &program)
 }
 
 /// Eval expression.
@@ -30,11 +30,11 @@ pub fn eval(script: &str, ctx: &mut Context) -> Result<ValueRef, String> {
 ///
 /// ```
 /// # use liexpr::{eval_expr, Context, Value};
-/// assert_eq!(eval_expr("1 + 2 * 3 - 4", &mut Context::default()), Ok(3.into()));
+/// assert_eq!(eval_expr("1 + 2 * 3 - 4", &mut Environment::default()), Ok(3.into()));
 /// ```
-pub fn eval_expr(expr: &str, ctx: &mut Context) -> Result<ValueRef, String> {
+pub fn eval_expr(expr: &str, environment: &mut Environment) -> Result<ValueRef, String> {
     let expr = Parser::parse_expression(expr)?;
-    eval_expression(ctx, &expr)
+    eval_expression(&mut Context::new(environment), &expr)
 }
 
 #[derive(Debug)]
@@ -70,6 +70,10 @@ impl Environment {
     pub fn take(&mut self, name: impl AsRef<str>) -> Option<Value> {
         self.variables.remove(name.as_ref()).map(|v| v.take())
     }
+
+    fn get(&self, name: impl AsRef<str>) -> Option<ValueRef> {
+        self.variables.get(name.as_ref()).cloned()
+    }
 }
 
 impl Default for Environment {
@@ -92,18 +96,18 @@ impl StackFrame {
 }
 
 #[derive(Debug)]
-pub struct Context {
+struct Context<'a> {
     stack: Vec<StackFrame>,
-    environment: Environment,
     functions: HashMap<String, Rc<Function>>,
+    environment: Option<&'a mut Environment>,
 }
 
-impl Context {
-    pub fn new(environment: Environment) -> Self {
+impl<'a> Context<'a> {
+    pub fn new(environment: impl Into<Option<&'a mut Environment>>) -> Self {
         Self {
             stack: vec![StackFrame::new()],
-            environment,
             functions: HashMap::new(),
+            environment: environment.into(),
         }
     }
 
@@ -124,19 +128,17 @@ impl Context {
     }
 
     fn get_variable(&self, name: &str) -> Option<ValueRef> {
-        if let Some(value) = self.environment.variables.get(name) {
-            return Some(value.clone());
-        }
-
         for frame in self.stack.iter().rev() {
             if let Some(value) = frame.locals.get(name) {
                 return Some(value.clone());
             }
         }
 
-        self.functions
-            .get(name)
-            .map(|_| Value::UserFunction(name.to_string()).into())
+        if let Some(_value) = self.functions.get(name) {
+            return Some(Value::UserFunction(name.to_string()).into());
+        }
+
+        self.environment.as_ref().and_then(|e| e.get(name))
     }
 
     fn set_variable(&mut self, name: &str, value: ValueRef) -> Result<(), String> {
@@ -157,15 +159,11 @@ impl Context {
     fn set_function(&mut self, name: &str, function: Rc<Function>) {
         self.functions.insert(name.to_string(), function);
     }
-
-    pub fn into_environment(self) -> Environment {
-        self.environment
-    }
 }
 
-impl Default for Context {
-    fn default() -> Context {
-        Context::new(Environment::new())
+impl<'a> Default for Context<'a> {
+    fn default() -> Context<'a> {
+        Context::new(None)
     }
 }
 
@@ -892,7 +890,7 @@ mod tests {
     fn test_eval_expression() {
         let expr = "1 + 2 * 3 - 4 / 2 + 5";
 
-        let result = eval_expr(expr, &mut Context::default()).unwrap();
+        let result = eval_expr(expr, &mut Environment::default()).unwrap();
 
         assert_eq!(result, 10);
     }
@@ -906,7 +904,7 @@ mod tests {
             return sum(1, 2);
         ";
 
-        let result = eval(script, &mut Context::default()).unwrap();
+        let result = eval(script, &mut Environment::default()).unwrap();
 
         assert_eq!(result, 3);
     }
@@ -929,7 +927,7 @@ mod tests {
             return f(10);
         ";
 
-        let result = eval(script, &mut Context::default()).unwrap();
+        let result = eval(script, &mut Environment::default()).unwrap();
 
         assert_eq!(result, 55);
     }
@@ -944,7 +942,7 @@ mod tests {
             return sum;
         ";
 
-        let result = eval(script, &mut Context::default()).unwrap();
+        let result = eval(script, &mut Environment::default()).unwrap();
 
         assert_eq!(result, 45);
     }
@@ -965,7 +963,7 @@ mod tests {
 
         env.define_function("fib", fib);
 
-        let result = eval_expr("fib(10)", &mut Context::new(env));
+        let result = eval_expr("fib(10)", &mut env);
 
         assert_eq!(result, Ok(55.into()));
     }
@@ -984,7 +982,7 @@ mod tests {
 
         env.define("s", s);
 
-        let result = eval(script, &mut Context::new(env)).unwrap();
+        let result = eval(script, &mut env).unwrap();
 
         assert_eq!(result, "hello world".to_string())
     }
@@ -1051,13 +1049,13 @@ mod tests {
 
         env.define("request", req);
 
-        let mut ctx = Context::new(env);
 
-        let result = eval(script, &mut ctx).unwrap();
+
+        let result = eval(script, &mut env).unwrap();
 
         assert_eq!(result, "ok");
 
-        let req = ctx.into_environment().take("request").unwrap();
+        let req = env.take("request").unwrap();
         let req = req.into_object::<Request>().unwrap();
 
         assert_eq!(req.body, "ok");
@@ -1089,7 +1087,7 @@ mod tests {
         ];
 
         for (script, ret) in inputs {
-            let result = eval(script, &mut Context::default()).unwrap();
+            let result = eval(script, &mut Environment::default()).unwrap();
 
             assert_eq!(result, ret);
         }
